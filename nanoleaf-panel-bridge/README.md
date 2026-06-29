@@ -1,0 +1,1 @@
+[![Open your Home Assistant instance and show the add repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_addon_repository/?repository_url=https://github.com/luka-kovac/nanoleaf-panel-bridge)
