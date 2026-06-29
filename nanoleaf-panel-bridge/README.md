@@ -2,7 +2,7 @@
 
 A bridge to expose Nanoleaf Shapes panels as individual panels in Home Assistant as MQTT lights.
 
-(https://my.home-assistant.io/badges/supervisor_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_addon_repository/?repository_url=https://github.com/luka-kovac/nanoleaf-panel-bridge)
+[![Open your Home Assistant instance and show the add app repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fluka-kovac%2Fnanoleaf-panel-bridge)
 
 ## Usage
 
@@ -65,3 +65,5 @@ zones:
     brightness_multiplier: 1
     max_brightness: 1
 ```
+
+**Please note this was created with the use of AI, my programming skills are not this good.**
