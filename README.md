@@ -2,13 +2,16 @@
 
 A bridge to expose Nanoleaf Shapes panels as individual panels in Home Assistant as MQTT lights.
 
-[![Open your Home Assistant instance and show the add repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_addon_repository/?repository_url=https://github.com/luka-kovac/nanoleaf-panel-bridge)
+(https://my.home-assistant.io/badges/supervisor_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_addon_repository/?repository_url=https://github.com/luka-kovac/nanoleaf-panel-bridge)
 
 ## Usage
 
 Install as a repository in Home Assitant and install the App.
+
 Ensure you have an MQTT broker (tested with Mosquitto in HA).
+
 You will need to edit the config as YAML.
+
 Ensure you have a token for your Nanoleaf Shapes panel by holding down the power button on the Shapes for 5-7 seconds until the lights flash, then running `curl -X POST http://xxx.xxx.xxx.xxx:16021/api/v1/new` with the IP address of your Shapes.
 
 ### Options
@@ -27,7 +30,7 @@ Ensure you have a token for your Nanoleaf Shapes panel by holding down the power
 
 Example config file:
 
-'''
+```
 nanoleaf_ip: xxx.xxx.xxx.xxx
 nanoleaf_token: TOKEN
 mqtt_host: core-mosquitto
@@ -61,4 +64,4 @@ zones:
       - 19960
     brightness_multiplier: 1
     max_brightness: 1
-'''
+```
