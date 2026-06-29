@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import paho.mqtt.client as mqtt
 import requests
@@ -60,6 +60,90 @@ def env_float(
     return value
 
 
+ADDON_OPTIONS_FILE = Path(os.environ.get("ADDON_OPTIONS_FILE", "/data/options.json"))
+
+
+def load_addon_options() -> dict:
+    """Read Home Assistant add-on options when running under Supervisor.
+
+    Environment variables remain supported so the bridge can still run as a plain
+    Python script or Docker container outside Home Assistant OS.
+    """
+    if not ADDON_OPTIONS_FILE.exists():
+        return {}
+
+    try:
+        data = json.loads(ADDON_OPTIONS_FILE.read_text())
+    except Exception as exc:
+        print(f"Could not read add-on options from {ADDON_OPTIONS_FILE}: {exc}")
+        return {}
+
+    if not isinstance(data, dict):
+        print(f"Ignoring add-on options because {ADDON_OPTIONS_FILE} did not contain an object")
+        return {}
+
+    return data
+
+
+ADDON_OPTIONS = load_addon_options()
+
+
+def config_value(option_name: str, env_name: str, default: Any = None, *, allow_empty: bool = False) -> Any:
+    if option_name in ADDON_OPTIONS:
+        value = ADDON_OPTIONS[option_name]
+        if allow_empty or value not in (None, ""):
+            return value
+
+    if env_name in os.environ:
+        value = os.environ.get(env_name)
+        if allow_empty or value not in (None, ""):
+            return value
+
+    return default
+
+
+def config_required(option_name: str, env_name: str) -> str:
+    value = config_value(option_name, env_name)
+    if value in (None, ""):
+        raise RuntimeError(
+            f"Missing required configuration option '{option_name}' "
+            f"or environment variable '{env_name}'"
+        )
+    return str(value)
+
+
+def parse_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+def config_bool(option_name: str, env_name: str, default: bool) -> bool:
+    return parse_bool(config_value(option_name, env_name, default), default)
+
+
+def config_int(option_name: str, env_name: str, default: int, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    value = int(config_value(option_name, env_name, default))
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def config_float(option_name: str, env_name: str, default: float, minimum: Optional[float] = None, maximum: Optional[float] = None) -> float:
+    value = float(config_value(option_name, env_name, default))
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
 def bounded_int(
     value: int | float,
     minimum: Optional[int] = None,
@@ -80,77 +164,133 @@ def bounded_int(
 # Configuration
 # ----------------------------
 
-NANOLEAF_IP = os.environ["NANOLEAF_IP"]
-NANOLEAF_TOKEN = os.environ["NANOLEAF_TOKEN"]
+NANOLEAF_IP = config_required("nanoleaf_ip", "NANOLEAF_IP")
+NANOLEAF_TOKEN = config_required("nanoleaf_token", "NANOLEAF_TOKEN")
 
-MQTT_HOST = os.environ.get("MQTT_HOST", "localhost")
-MQTT_PORT = env_int("MQTT_PORT", 1883)
-MQTT_USER = os.environ.get("MQTT_USER")
-MQTT_PASS = os.environ.get("MQTT_PASS")
+MQTT_HOST = str(config_value("mqtt_host", "MQTT_HOST", "localhost"))
+MQTT_PORT = config_int("mqtt_port", "MQTT_PORT", 1883)
+MQTT_USER = config_value("mqtt_user", "MQTT_USER", None)
+MQTT_PASS = config_value("mqtt_password", "MQTT_PASS", None, allow_empty=True)
 
-DISCOVERY_PREFIX = os.environ.get("DISCOVERY_PREFIX", "homeassistant")
-BASE_TOPIC = os.environ.get("BASE_TOPIC", "nanoleaf_bridge/shapes")
+if MQTT_USER == "":
+    MQTT_USER = None
+if MQTT_PASS == "":
+    MQTT_PASS = None
 
-DEVICE_ID = os.environ.get(
-    "DEVICE_ID",
-    f"nanoleaf_shapes_{NANOLEAF_IP.replace('.', '_')}",
+DISCOVERY_PREFIX = str(config_value("discovery_prefix", "DISCOVERY_PREFIX", "homeassistant"))
+BASE_TOPIC = str(config_value("base_topic", "BASE_TOPIC", "nanoleaf_bridge/shapes"))
+
+DEVICE_ID = str(
+    config_value(
+        "device_id",
+        "DEVICE_ID",
+        f"nanoleaf_shapes_{NANOLEAF_IP.replace('.', '_')}",
+    )
 )
-DEVICE_NAME = os.environ.get("DEVICE_NAME", "Nanoleaf Shapes")
+DEVICE_NAME = str(config_value("device_name", "DEVICE_NAME", "Nanoleaf Shapes"))
 
 NANOLEAF_BASE_URL = f"http://{NANOLEAF_IP}:16021/api/v1/{NANOLEAF_TOKEN}"
 
 # Output mode:
 #   OUTPUT_MODE=stream  -> extControl UDP streaming
 #   OUTPUT_MODE=rest    -> REST static custom effect fallback
-OUTPUT_MODE = os.environ.get("OUTPUT_MODE", "stream").lower()
+OUTPUT_MODE = str(config_value("output_mode", "OUTPUT_MODE", "stream")).lower()
 USE_STREAMING = OUTPUT_MODE in {"stream", "udp", "extcontrol", "ext_control"}
 
-RENDER_DEBOUNCE_SECONDS = env_float("RENDER_DEBOUNCE_SECONDS", 0.15, minimum=0.0)
-
-# For a Home Assistant add-on later, use:
-# STATE_FILE=/data/nanoleaf_panel_state.json
-STATE_FILE = Path(os.environ.get("STATE_FILE", "nanoleaf_panel_state.json"))
-
-RENDER_ON_STARTUP = env_bool("RENDER_ON_STARTUP", False)
-RESTORE_ONLY_IF_NANOLEAF_ON = env_bool("RESTORE_ONLY_IF_NANOLEAF_ON", True)
-
-FORCE_GLOBAL_ON_ON_RENDER = env_bool("FORCE_GLOBAL_ON_ON_RENDER", True)
-
-FORCE_GLOBAL_BRIGHTNESS_ON_RENDER = env_bool("FORCE_GLOBAL_BRIGHTNESS_ON_RENDER", True)
-GLOBAL_BRIGHTNESS_VALUE = env_int(
-    "GLOBAL_BRIGHTNESS_VALUE", 100, minimum=1, maximum=100
+RENDER_DEBOUNCE_SECONDS = config_float(
+    "render_debounce_seconds",
+    "RENDER_DEBOUNCE_SECONDS",
+    0.15,
+    minimum=0.0,
 )
 
-TURN_GLOBAL_OFF_WHEN_FRAME_EMPTY = env_bool("TURN_GLOBAL_OFF_WHEN_FRAME_EMPTY", True)
+# For a Home Assistant add-on, the default is persistent add-on data.
+STATE_FILE = Path(str(config_value("state_file", "STATE_FILE", "/data/nanoleaf_panel_state.json")))
 
-SYNC_GLOBAL_STATE = env_bool("SYNC_GLOBAL_STATE", True)
-GLOBAL_SYNC_INTERVAL_SECONDS = env_float(
-    "GLOBAL_SYNC_INTERVAL_SECONDS", 5.0, minimum=1.0
+RENDER_ON_STARTUP = config_bool("render_on_startup", "RENDER_ON_STARTUP", False)
+RESTORE_ONLY_IF_NANOLEAF_ON = config_bool(
+    "restore_only_if_nanoleaf_on",
+    "RESTORE_ONLY_IF_NANOLEAF_ON",
+    True,
 )
 
-RESTORE_FRAMEBUFFER_WHEN_GLOBAL_TURNS_ON = env_bool(
+FORCE_GLOBAL_ON_ON_RENDER = config_bool(
+    "force_global_on_on_render",
+    "FORCE_GLOBAL_ON_ON_RENDER",
+    True,
+)
+
+FORCE_GLOBAL_BRIGHTNESS_ON_RENDER = config_bool(
+    "force_global_brightness_on_render",
+    "FORCE_GLOBAL_BRIGHTNESS_ON_RENDER",
+    True,
+)
+GLOBAL_BRIGHTNESS_VALUE = config_int(
+    "global_brightness_value",
+    "GLOBAL_BRIGHTNESS_VALUE",
+    100,
+    minimum=1,
+    maximum=100,
+)
+
+TURN_GLOBAL_OFF_WHEN_FRAME_EMPTY = config_bool(
+    "turn_global_off_when_frame_empty",
+    "TURN_GLOBAL_OFF_WHEN_FRAME_EMPTY",
+    True,
+)
+
+SYNC_GLOBAL_STATE = config_bool("sync_global_state", "SYNC_GLOBAL_STATE", True)
+GLOBAL_SYNC_INTERVAL_SECONDS = config_float(
+    "global_sync_interval_seconds",
+    "GLOBAL_SYNC_INTERVAL_SECONDS",
+    5.0,
+    minimum=1.0,
+)
+
+RESTORE_FRAMEBUFFER_WHEN_GLOBAL_TURNS_ON = config_bool(
+    "restore_framebuffer_when_global_turns_on",
     "RESTORE_FRAMEBUFFER_WHEN_GLOBAL_TURNS_ON",
     True,
 )
 
-PUBLISH_EFFECTIVE_OFF_WHEN_GLOBAL_OFF = env_bool(
+PUBLISH_EFFECTIVE_OFF_WHEN_GLOBAL_OFF = config_bool(
+    "publish_effective_off_when_global_off",
     "PUBLISH_EFFECTIVE_OFF_WHEN_GLOBAL_OFF",
     True,
 )
 
 # Effects dropdown on the All Panels MQTT light.
-ENABLE_NANOLEAF_EFFECTS = env_bool("ENABLE_NANOLEAF_EFFECTS", True)
-BRIDGE_EFFECT_NAME = os.environ.get("BRIDGE_EFFECT_NAME", "Bridge Framebuffer")
+ENABLE_NANOLEAF_EFFECTS = config_bool(
+    "enable_nanoleaf_effects",
+    "ENABLE_NANOLEAF_EFFECTS",
+    True,
+)
+BRIDGE_EFFECT_NAME = str(
+    config_value("bridge_effect_name", "BRIDGE_EFFECT_NAME", "Bridge Framebuffer")
+)
 
 # extControl streaming options
-EXTCONTROL_PORT = env_int("EXTCONTROL_PORT", 60222, minimum=1, maximum=65535)
-STREAM_FPS = env_float("STREAM_FPS", 25.0, minimum=1.0, maximum=60.0)
+EXTCONTROL_PORT = config_int(
+    "extcontrol_port",
+    "EXTCONTROL_PORT",
+    60222,
+    minimum=1,
+    maximum=65535,
+)
+STREAM_FPS = config_float("stream_fps", "STREAM_FPS", 25.0, minimum=1.0, maximum=60.0)
 
 # Nanoleaf transition time is in tenths of a second.
 # 0 = immediate, 1 = 100 ms, 10 = 1 second.
-STREAM_TRANSITION_TIME = env_int("STREAM_TRANSITION_TIME", 1, minimum=0, maximum=65535)
+STREAM_TRANSITION_TIME = config_int(
+    "stream_transition_time",
+    "STREAM_TRANSITION_TIME",
+    1,
+    minimum=0,
+    maximum=65535,
+)
 
-EXTCONTROL_REENABLE_INTERVAL_SECONDS = env_float(
+EXTCONTROL_REENABLE_INTERVAL_SECONDS = config_float(
+    "extcontrol_reenable_interval_seconds",
     "EXTCONTROL_REENABLE_INTERVAL_SECONDS",
     30.0,
     minimum=5.0,
@@ -170,8 +310,190 @@ class Panel:
     shape_type: Optional[int] = None
 
 
+@dataclass
+class Zone:
+    zone_id: str
+    name: str
+    panel_ids: List[int]
+
+
+def slugify_identifier(value: str) -> str:
+    value = value.strip().lower()
+    chars = []
+    previous_underscore = False
+
+    for char in value:
+        if char.isalnum():
+            chars.append(char)
+            previous_underscore = False
+        elif not previous_underscore:
+            chars.append("_")
+            previous_underscore = True
+
+    slug = "".join(chars).strip("_")
+    return slug or "zone"
+
+
+def parse_panel_ids(raw_value: Any) -> List[int]:
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        # Accept either "1,2,3" or a JSON-style string such as "[1, 2, 3]".
+        text = raw_value.strip()
+        if not text:
+            return []
+
+        if text.startswith("["):
+            try:
+                raw_value = json.loads(text)
+            except json.JSONDecodeError:
+                raw_value = text.split(",")
+        else:
+            raw_value = text.split(",")
+
+    if not isinstance(raw_value, list):
+        return []
+
+    panel_ids: List[int] = []
+    for item in raw_value:
+        try:
+            panel_ids.append(int(item))
+        except (TypeError, ValueError):
+            print(f"Ignoring invalid zone panel id: {item!r}")
+
+    # Preserve order while removing duplicates.
+    seen = set()
+    result = []
+    for panel_id in panel_ids:
+        if panel_id not in seen:
+            seen.add(panel_id)
+            result.append(panel_id)
+
+    return result
+
+
+def load_zones_from_options(valid_panel_ids: set[int]) -> List[Zone]:
+    raw_zones = ADDON_OPTIONS.get("zones", [])
+
+    if isinstance(raw_zones, str):
+        try:
+            raw_zones = json.loads(raw_zones)
+        except json.JSONDecodeError:
+            print("Ignoring zones option because it was not valid JSON")
+            return []
+
+    if raw_zones is None:
+        return []
+
+    if not isinstance(raw_zones, list):
+        print("Ignoring zones option because it is not a list")
+        return []
+
+    zones: List[Zone] = []
+    used_ids: set[str] = set()
+
+    for index, item in enumerate(raw_zones, start=1):
+        if not isinstance(item, dict):
+            print(f"Ignoring zone #{index}; expected an object")
+            continue
+
+        name = str(item.get("name") or f"Zone {index}")
+        zone_id = slugify_identifier(str(item.get("id") or name))
+
+        if zone_id in used_ids:
+            base_zone_id = zone_id
+            suffix = 2
+            while f"{base_zone_id}_{suffix}" in used_ids:
+                suffix += 1
+            zone_id = f"{base_zone_id}_{suffix}"
+
+        panel_ids = parse_panel_ids(item.get("panels"))
+        unknown_panel_ids = [panel_id for panel_id in panel_ids if panel_id not in valid_panel_ids]
+        panel_ids = [panel_id for panel_id in panel_ids if panel_id in valid_panel_ids]
+
+        if unknown_panel_ids:
+            print(
+                f"Zone '{name}' references unknown Nanoleaf panels; ignoring: "
+                f"{unknown_panel_ids}"
+            )
+
+        if not panel_ids:
+            print(f"Ignoring zone '{name}' because it has no valid panels")
+            continue
+
+        used_ids.add(zone_id)
+        zones.append(Zone(zone_id=zone_id, name=name, panel_ids=panel_ids))
+
+    return zones
+
+
 def clamp(value: int | float, minimum: int = 0, maximum: int = 255) -> int:
     return max(minimum, min(maximum, int(round(float(value)))))
+
+
+def xy_to_rgb(x: float, y: float) -> dict:
+    """Convert CIE 1931 xy to sRGB at full brightness.
+
+    The bridge stores colour separately from brightness. Rendering later applies
+    the panel brightness, so this function intentionally returns an un-dimmed RGB
+    colour.
+    """
+    x = max(0.0, min(1.0, float(x)))
+    y = max(0.0001, min(1.0, float(y)))
+
+    Y = 1.0
+    X = (Y / y) * x
+    Z = (Y / y) * (1.0 - x - y)
+
+    r = X * 1.656492 - Y * 0.354851 - Z * 0.255038
+    g = -X * 0.707196 + Y * 1.655397 + Z * 0.036152
+    b = X * 0.051713 - Y * 0.121364 + Z * 1.011530
+
+    r = max(0.0, r)
+    g = max(0.0, g)
+    b = max(0.0, b)
+
+    max_component = max(r, g, b)
+    if max_component > 1.0:
+        r /= max_component
+        g /= max_component
+        b /= max_component
+
+    def gamma_correct(component: float) -> int:
+        if component <= 0.0031308:
+            corrected = 12.92 * component
+        else:
+            corrected = 1.055 * (component ** (1.0 / 2.4)) - 0.055
+        return clamp(corrected * 255)
+
+    return {
+        "r": gamma_correct(r),
+        "g": gamma_correct(g),
+        "b": gamma_correct(b),
+    }
+
+
+def extract_xy_from_payload(payload: dict) -> Optional[Tuple[float, float]]:
+    if "xy_color" in payload and isinstance(payload["xy_color"], list) and len(payload["xy_color"]) >= 2:
+        return float(payload["xy_color"][0]), float(payload["xy_color"][1])
+
+    if "xy" in payload:
+        value = payload["xy"]
+        if isinstance(value, list) and len(value) >= 2:
+            return float(value[0]), float(value[1])
+        if isinstance(value, str) and "," in value:
+            x_text, y_text = value.split(",", 1)
+            return float(x_text), float(y_text)
+
+    color = payload.get("color")
+    if isinstance(color, dict):
+        if "x" in color and "y" in color:
+            return float(color["x"]), float(color["y"])
+        if "xy" in color and isinstance(color["xy"], list) and len(color["xy"]) >= 2:
+            return float(color["xy"][0]), float(color["xy"][1])
+
+    return None
 
 
 def default_panel_state() -> dict:
@@ -287,9 +609,11 @@ def get_panel_layout() -> List[Panel]:
 
 
 class NanoleafBridge:
-    def __init__(self, panels: List[Panel]):
+    def __init__(self, panels: List[Panel], zones: Optional[List[Zone]] = None):
         self.panels = panels
         self.panel_ids = [panel.panel_id for panel in panels]
+        self.zones = zones or []
+        self.zones_by_id = {zone.zone_id: zone for zone in self.zones}
 
         self.lock = threading.RLock()
 
@@ -386,6 +710,7 @@ class NanoleafBridge:
 
         client.subscribe(f"{BASE_TOPIC}/set")
         client.subscribe(f"{BASE_TOPIC}/panel/+/set")
+        client.subscribe(f"{BASE_TOPIC}/zone/+/set")
         client.subscribe("homeassistant/status")
 
         if SYNC_GLOBAL_STATE:
@@ -433,8 +758,12 @@ class NanoleafBridge:
         try:
             payload = json.loads(payload_raw)
         except json.JSONDecodeError:
-            print(f"Invalid JSON on {topic}: {payload_raw}")
-            return
+            state_payload = payload_raw.strip().upper()
+            if state_payload in {"ON", "OFF"}:
+                payload = {"state": state_payload}
+            else:
+                print(f"Invalid JSON on {topic}: {payload_raw}")
+                return
 
         try:
             if topic == f"{BASE_TOPIC}/set":
@@ -442,6 +771,9 @@ class NanoleafBridge:
             elif topic.startswith(f"{BASE_TOPIC}/panel/") and topic.endswith("/set"):
                 panel_id = int(topic.split("/")[-2])
                 self.handle_panel_command(panel_id, payload)
+            elif topic.startswith(f"{BASE_TOPIC}/zone/") and topic.endswith("/set"):
+                zone_id = topic.split("/")[-2]
+                self.handle_zone_command(zone_id, payload)
         except Exception as exc:
             print(f"Error handling MQTT command on {topic}: {exc}")
 
@@ -507,6 +839,34 @@ class NanoleafBridge:
             self.save_state()
 
         self.publish_panel_state(panel_id)
+        self.publish_whole_state()
+        self.publish_global_attributes()
+        self.schedule_render()
+
+    def handle_zone_command(self, zone_id: str, payload: dict):
+        zone = self.zones_by_id.get(zone_id)
+        if zone is None:
+            print(f"Ignoring command for unknown zone {zone_id}")
+            return
+
+        with self.lock:
+            for panel_id in zone.panel_ids:
+                if panel_id not in self.state:
+                    print(f"Ignoring zone panel {panel_id}; not in current Nanoleaf layout")
+                    continue
+
+                self.apply_payload_to_panel(panel_id, payload)
+
+            # Any zone command exits native Nanoleaf effect mode.
+            self.active_effect = None
+
+            self.update_optimistic_device_power_from_framebuffer()
+            self.save_state()
+
+        self.publish_zone_state(zone)
+        for panel_id in zone.panel_ids:
+            if panel_id in self.state:
+                self.publish_panel_state(panel_id)
         self.publish_whole_state()
         self.publish_global_attributes()
         self.schedule_render()
@@ -635,11 +995,29 @@ class NanoleafBridge:
         if "state" in payload:
             state_value = str(payload["state"]).upper()
             panel_state["state"] = "ON" if state_value == "ON" else "OFF"
+        elif "on" in payload:
+            panel_state["state"] = "ON" if bool(payload["on"]) else "OFF"
 
         if "brightness" in payload:
             panel_state["brightness"] = clamp(payload["brightness"])
+        elif "bri" in payload:
+            # Hue-style brightness is usually 1-254; normalise to HA's 0-255 scale.
+            panel_state["brightness"] = bounded_int(
+                (float(payload["bri"]) / 254.0) * 255.0,
+                minimum=0,
+                maximum=255,
+            )
 
-        if "color" in payload:
+        xy_value = None
+        try:
+            xy_value = extract_xy_from_payload(payload)
+        except (TypeError, ValueError) as exc:
+            print(f"Ignoring invalid xy colour payload: {payload!r}: {exc}")
+
+        if xy_value is not None:
+            x, y = xy_value
+            panel_state["color"] = xy_to_rgb(x, y)
+        elif "color" in payload:
             color = payload["color"]
             if isinstance(color, dict):
                 panel_state["color"] = {
@@ -660,8 +1038,8 @@ class NanoleafBridge:
             except (TypeError, ValueError):
                 print(f"Ignoring invalid transition value: {payload['transition']}")
 
-        # HA often sends brightness/color without explicit state.
-        if "brightness" in payload or "color" in payload:
+        # HA often sends brightness/colour without explicit state.
+        if "brightness" in payload or "bri" in payload or "color" in payload or xy_value is not None:
             panel_state["state"] = "ON"
 
         panel_state["color_mode"] = "rgb"
@@ -1508,16 +1886,59 @@ class NanoleafBridge:
                 retain=True,
             )
 
+        for zone in self.zones:
+            unique_id = f"{DEVICE_ID}_zone_{zone.zone_id}"
+            zone_panel_unique_ids = [
+                f"{DEVICE_ID}_panel_{panel_id}" for panel_id in zone.panel_ids
+            ]
+
+            zone_config = {
+                "name": zone.name,
+                "unique_id": unique_id,
+                "schema": "json",
+                "command_topic": f"{BASE_TOPIC}/zone/{zone.zone_id}/set",
+                "state_topic": f"{BASE_TOPIC}/zone/{zone.zone_id}/state",
+                "json_attributes_topic": f"{BASE_TOPIC}/zone/{zone.zone_id}/attributes",
+                "availability_topic": f"{BASE_TOPIC}/status",
+                "brightness": True,
+                "supported_color_modes": ["rgb", "xy"],
+                "optimistic": False,
+                "device": device,
+                "group": zone_panel_unique_ids,
+                "icon": "mdi:shape-polygon-plus",
+            }
+
+            self.client.publish(
+                f"{DISCOVERY_PREFIX}/light/{unique_id}/config",
+                json.dumps(zone_config),
+                retain=True,
+            )
+
+            attrs = {
+                "zone_id": zone.zone_id,
+                "panel_ids": zone.panel_ids,
+                "panel_count": len(zone.panel_ids),
+            }
+
+            self.client.publish(
+                f"{BASE_TOPIC}/zone/{zone.zone_id}/attributes",
+                json.dumps(attrs),
+                retain=True,
+            )
+
         self.publish_global_attributes()
 
         print(
-            f"Published MQTT discovery for {len(self.panels)} panels "
-            "plus whole-light entity"
+            f"Published MQTT discovery for {len(self.panels)} panels, "
+            f"{len(self.zones)} zones, plus whole-light entity"
         )
 
     def publish_all_states(self):
         for panel_id in self.panel_ids:
             self.publish_panel_state(panel_id)
+
+        for zone in self.zones:
+            self.publish_zone_state(zone)
 
         self.publish_whole_state()
 
@@ -1544,11 +1965,77 @@ class NanoleafBridge:
 
         return effective
 
+    def aggregate_panel_ids_state(self, panel_ids: List[int]) -> dict:
+        with self.lock:
+            device_power_on = self.device_power_on
+            state_values = [
+                normalise_panel_state(self.state[panel_id])
+                for panel_id in panel_ids
+                if panel_id in self.state
+            ]
+
+        off_state = {
+            "state": "OFF",
+            "color_mode": "rgb",
+            "brightness": 255,
+            "color": {
+                "r": 255,
+                "g": 255,
+                "b": 255,
+            },
+            "transition": STREAM_TRANSITION_TIME,
+        }
+
+        if not state_values:
+            return off_state
+
+        if PUBLISH_EFFECTIVE_OFF_WHEN_GLOBAL_OFF and device_power_on is False:
+            return off_state
+
+        on_panels = [state for state in state_values if state["state"] == "ON"]
+        if not on_panels:
+            return off_state
+
+        brightness = round(
+            sum(panel["brightness"] for panel in on_panels) / len(on_panels)
+        )
+
+        color = {
+            "r": round(sum(panel["color"]["r"] for panel in on_panels) / len(on_panels)),
+            "g": round(sum(panel["color"]["g"] for panel in on_panels) / len(on_panels)),
+            "b": round(sum(panel["color"]["b"] for panel in on_panels) / len(on_panels)),
+        }
+
+        transition = round(
+            sum(
+                panel.get("transition", STREAM_TRANSITION_TIME)
+                for panel in on_panels
+            )
+            / len(on_panels)
+        )
+
+        return {
+            "state": "ON",
+            "color_mode": "rgb",
+            "brightness": brightness,
+            "color": color,
+            "transition": bounded_int(transition, minimum=0, maximum=65535),
+        }
+
     def publish_panel_state(self, panel_id: int):
         payload = json.dumps(self.effective_panel_state(panel_id))
 
         self.client.publish(
             f"{BASE_TOPIC}/panel/{panel_id}/state",
+            payload,
+            retain=True,
+        )
+
+    def publish_zone_state(self, zone: Zone):
+        payload = json.dumps(self.aggregate_panel_ids_state(zone.panel_ids))
+
+        self.client.publish(
+            f"{BASE_TOPIC}/zone/{zone.zone_id}/state",
             payload,
             retain=True,
         )
@@ -1659,6 +2146,15 @@ class NanoleafBridge:
                 "active_effect": self.active_effect or BRIDGE_EFFECT_NAME,
                 "effect_count": len(self.effects),
                 "effects": self.get_effect_list_for_ha(),
+                "zone_count": len(self.zones),
+                "zones": [
+                    {
+                        "id": zone.zone_id,
+                        "name": zone.name,
+                        "panel_ids": zone.panel_ids,
+                    }
+                    for zone in self.zones
+                ],
             }
 
         self.client.publish(
@@ -1687,7 +2183,15 @@ def main():
             f"x={panel.x}, y={panel.y}, shape_type={panel.shape_type}"
         )
 
-    bridge = NanoleafBridge(panels)
+    zones = load_zones_from_options({panel.panel_id for panel in panels})
+    if zones:
+        print("Configured zones:")
+        for zone in zones:
+            print(f"  {zone.zone_id} ({zone.name}): {zone.panel_ids}")
+    else:
+        print("No configured zones; only All Panels and individual panel lights will be exposed")
+
+    bridge = NanoleafBridge(panels, zones=zones)
     bridge.start()
 
 
