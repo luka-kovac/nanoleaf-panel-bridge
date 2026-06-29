@@ -1,5 +1,5 @@
 name: Nanoleaf Panel Bridge
-version: "0.1.5"
+version: "0.1.6"
 slug: nanoleaf_panel_bridge
 description: Expose Nanoleaf Shapes panels and configurable zones as MQTT lights
 startup: services
@@ -24,6 +24,12 @@ options:
   global_brightness_value: 100
   sync_global_state: true
   global_sync_interval_seconds: 5
+  enable_layout_preview: true
+  layout_preview_debounce_seconds: 0.25
+  layout_preview_padding: 24
+  layout_preview_labels: true
+  layout_preview_background: "#101418"
+  layout_preview_stroke: "#d7dde5"
   zones: []
 
 schema:
@@ -40,6 +46,12 @@ schema:
   global_brightness_value: int
   sync_global_state: bool
   global_sync_interval_seconds: int
+  enable_layout_preview: bool
+  layout_preview_debounce_seconds: float
+  layout_preview_padding: int
+  layout_preview_labels: bool
+  layout_preview_background: str
+  layout_preview_stroke: str
   zones:
     - id: str
       name: str

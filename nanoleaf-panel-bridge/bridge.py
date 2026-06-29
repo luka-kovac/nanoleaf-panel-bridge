@@ -1,5 +1,7 @@
 import copy
+import html
 import json
+import math
 import os
 import socket
 import struct
@@ -296,6 +298,39 @@ EXTCONTROL_REENABLE_INTERVAL_SECONDS = config_float(
     minimum=5.0,
 )
 
+# Layout / preview publishing. The preview is published as an MQTT image entity
+# using raw SVG bytes. The layout JSON is retained separately for dashboards,
+# custom cards, or external tools.
+ENABLE_LAYOUT_PREVIEW = config_bool(
+    "enable_layout_preview",
+    "ENABLE_LAYOUT_PREVIEW",
+    True,
+)
+LAYOUT_PREVIEW_DEBOUNCE_SECONDS = config_float(
+    "layout_preview_debounce_seconds",
+    "LAYOUT_PREVIEW_DEBOUNCE_SECONDS",
+    0.25,
+    minimum=0.0,
+)
+LAYOUT_PREVIEW_PADDING = config_int(
+    "layout_preview_padding",
+    "LAYOUT_PREVIEW_PADDING",
+    24,
+    minimum=0,
+    maximum=500,
+)
+LAYOUT_PREVIEW_LABELS = config_bool(
+    "layout_preview_labels",
+    "LAYOUT_PREVIEW_LABELS",
+    True,
+)
+LAYOUT_PREVIEW_BACKGROUND = str(
+    config_value("layout_preview_background", "LAYOUT_PREVIEW_BACKGROUND", "#101418")
+)
+LAYOUT_PREVIEW_STROKE = str(
+    config_value("layout_preview_stroke", "LAYOUT_PREVIEW_STROKE", "#d7dde5")
+)
+
 
 # ----------------------------
 # Data model
@@ -308,6 +343,7 @@ class Panel:
     x: int = 0
     y: int = 0
     shape_type: Optional[int] = None
+    orientation: int = 0
 
 
 @dataclass
@@ -563,6 +599,115 @@ def extract_xy_from_payload(payload: dict) -> Optional[Tuple[float, float]]:
     return None
 
 
+def parse_panel_orientation(raw_item: dict) -> int:
+    """Extract panel orientation from the Nanoleaf layout item.
+
+    Nanoleaf firmware/API variants may expose this as 'orientation', 'o',
+    'rotation', or not at all. The bridge keeps using zero when unavailable.
+    """
+    for key in ("orientation", "o", "rotation", "rot"):
+        if key in raw_item:
+            try:
+                return bounded_int(raw_item[key], minimum=0, maximum=359)
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+def normalise_degrees(value: int | float) -> float:
+    return float(value) % 360.0
+
+
+def shape_kind_for_type(shape_type: Optional[int]) -> str:
+    # Common Nanoleaf values: Shapes Hexagons=7, Shapes Triangles=8,
+    # Shapes Mini Triangles=9. Older Light Panels are also triangular.
+    if shape_type in {1, 2, 8}:
+        return "triangle"
+    if shape_type in {9}:
+        return "mini_triangle"
+    if shape_type in {3, 4}:
+        return "square"
+    return "hexagon"
+
+
+def infer_panel_radius(panels: List[Panel]) -> float:
+    distances: List[float] = []
+    for index, a in enumerate(panels):
+        for b in panels[index + 1:]:
+            distance = math.hypot(a.x - b.x, a.y - b.y)
+            if distance > 0:
+                distances.append(distance)
+
+    if not distances:
+        return 50.0
+
+    # This is deliberately approximate. It creates a readable dashboard preview
+    # across mixed Shapes layouts without needing exact physical panel dimensions.
+    return max(18.0, min(distances) * 0.42)
+
+
+def regular_polygon_points(
+    center_x: float,
+    center_y: float,
+    radius: float,
+    sides: int,
+    rotation_degrees: float,
+) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    for index in range(sides):
+        angle = math.radians(rotation_degrees + (360.0 * index / sides))
+        points.append((
+            center_x + radius * math.cos(angle),
+            center_y + radius * math.sin(angle),
+        ))
+    return points
+
+
+def panel_polygon_points(panel: Panel, radius: float) -> List[Tuple[float, float]]:
+    # SVG has positive Y downward. Nanoleaf layout coordinates are easier to
+    # reason about if positive Y is treated as upward, so invert here.
+    center_x = float(panel.x)
+    center_y = float(-panel.y)
+    orientation = normalise_degrees(panel.orientation)
+    shape_kind = shape_kind_for_type(panel.shape_type)
+
+    if shape_kind == "triangle":
+        return regular_polygon_points(center_x, center_y, radius * 1.05, 3, -90 + orientation)
+    if shape_kind == "mini_triangle":
+        return regular_polygon_points(center_x, center_y, radius * 0.68, 3, -90 + orientation)
+    if shape_kind == "square":
+        return regular_polygon_points(center_x, center_y, radius * 0.92, 4, 45 + orientation)
+
+    return regular_polygon_points(center_x, center_y, radius, 6, 30 + orientation)
+
+
+def svg_colour_for_panel_state(state: dict) -> str:
+    state = normalise_panel_state(state)
+    if state["state"] != "ON":
+        return "#0f1115"
+
+    brightness = state["brightness"] / 255.0
+    color = state["color"]
+    r = clamp(color["r"] * brightness)
+    g = clamp(color["g"] * brightness)
+    b = clamp(color["b"] * brightness)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def panel_text_colour(state: dict) -> str:
+    state = normalise_panel_state(state)
+    if state["state"] != "ON":
+        return "#d7dde5"
+
+    brightness = state["brightness"] / 255.0
+    color = state["color"]
+    r = clamp(color["r"] * brightness)
+    g = clamp(color["g"] * brightness)
+    b = clamp(color["b"] * brightness)
+    # Relative luminance approximation.
+    return "#101418" if (0.299 * r + 0.587 * g + 0.114 * b) > 150 else "#ffffff"
+
+
 def default_panel_state() -> dict:
     return {
         "state": "OFF",
@@ -661,6 +806,7 @@ def get_panel_layout() -> List[Panel]:
                 x=int(item.get("x", 0)),
                 y=int(item.get("y", 0)),
                 shape_type=shape_type,
+                orientation=parse_panel_orientation(item),
             )
         )
 
@@ -685,6 +831,8 @@ class NanoleafBridge:
         self.lock = threading.RLock()
 
         self.render_timer: Optional[threading.Timer] = None
+
+        self.preview_timer: Optional[threading.Timer] = None
 
         self.global_sync_timer: Optional[threading.Timer] = None
         self.global_sync_started = False
@@ -752,6 +900,10 @@ class NanoleafBridge:
                 self.render_timer.cancel()
                 self.render_timer = None
 
+            if self.preview_timer is not None:
+                self.preview_timer.cancel()
+                self.preview_timer = None
+
             if self.global_sync_timer is not None:
                 self.global_sync_timer.cancel()
                 self.global_sync_timer = None
@@ -787,7 +939,9 @@ class NanoleafBridge:
             self.refresh_effects(publish=False)
 
         self.publish_discovery()
+        self.publish_layout_json()
         self.publish_all_states()
+        self.schedule_preview_publish(immediate=True)
 
         if SYNC_GLOBAL_STATE:
             self.start_global_sync()
@@ -819,7 +973,9 @@ class NanoleafBridge:
                 self.refresh_effects(publish=False)
 
             self.publish_discovery()
+            self.publish_layout_json()
             self.publish_all_states()
+            self.schedule_preview_publish(immediate=True)
             return
 
         try:
@@ -889,6 +1045,7 @@ class NanoleafBridge:
 
         self.publish_all_states()
         self.publish_global_attributes()
+        self.schedule_preview_publish()
         self.schedule_render()
 
     def handle_panel_command(self, panel_id: int, payload: dict):
@@ -908,6 +1065,7 @@ class NanoleafBridge:
         self.publish_panel_state(panel_id)
         self.publish_whole_state()
         self.publish_global_attributes()
+        self.schedule_preview_publish()
         self.schedule_render()
 
     def scaled_zone_payload(self, zone: Zone, payload: dict) -> dict:
@@ -973,6 +1131,7 @@ class NanoleafBridge:
                 self.publish_panel_state(panel_id)
         self.publish_whole_state()
         self.publish_global_attributes()
+        self.schedule_preview_publish()
         self.schedule_render()
 
     def handle_effect_command(self, effect_name: str, payload: dict):
@@ -1912,6 +2071,209 @@ class NanoleafBridge:
         return bytes(packet)
 
     # ----------------------------
+    # Layout JSON and SVG preview
+    # ----------------------------
+
+    def build_layout_payload(self) -> dict:
+        radius = infer_panel_radius(self.panels)
+        panel_items = []
+
+        for panel in self.panels:
+            polygon = panel_polygon_points(panel, radius)
+            panel_items.append(
+                {
+                    "panel_id": panel.panel_id,
+                    "x": panel.x,
+                    "y": panel.y,
+                    "shape_type": panel.shape_type,
+                    "shape": shape_kind_for_type(panel.shape_type),
+                    "orientation": panel.orientation,
+                    "polygon": [
+                        {"x": round(x, 3), "y": round(y, 3)}
+                        for x, y in polygon
+                    ],
+                    "mqtt_command_topic": f"{BASE_TOPIC}/panel/{panel.panel_id}/set",
+                    "mqtt_state_topic": f"{BASE_TOPIC}/panel/{panel.panel_id}/state",
+                }
+            )
+
+        all_points = [
+            (point["x"], point["y"])
+            for item in panel_items
+            for point in item["polygon"]
+        ]
+        if all_points:
+            min_x = min(x for x, _ in all_points)
+            max_x = max(x for x, _ in all_points)
+            min_y = min(y for _, y in all_points)
+            max_y = max(y for _, y in all_points)
+        else:
+            min_x = min_y = 0
+            max_x = max_y = 1
+
+        return {
+            "device_id": DEVICE_ID,
+            "device_name": DEVICE_NAME,
+            "base_topic": BASE_TOPIC,
+            "panel_count": len(panel_items),
+            "panels": panel_items,
+            "zones": [
+                {
+                    "id": zone.zone_id,
+                    "name": zone.name,
+                    "panel_ids": zone.panel_ids,
+                    "brightness_multiplier": zone.brightness_multiplier,
+                    "max_brightness": zone.max_brightness,
+                    "effective_max_brightness": zone_effective_max_brightness(zone),
+                    "mqtt_command_topic": f"{BASE_TOPIC}/zone/{zone.zone_id}/set",
+                    "mqtt_state_topic": f"{BASE_TOPIC}/zone/{zone.zone_id}/state",
+                }
+                for zone in self.zones
+            ],
+            "bounds": {
+                "min_x": round(min_x, 3),
+                "max_x": round(max_x, 3),
+                "min_y": round(min_y, 3),
+                "max_y": round(max_y, 3),
+                "width": round(max_x - min_x, 3),
+                "height": round(max_y - min_y, 3),
+            },
+        }
+
+    def publish_layout_json(self):
+        payload = self.build_layout_payload()
+
+        self.client.publish(
+            f"{BASE_TOPIC}/layout",
+            json.dumps(payload, separators=(",", ":")),
+            retain=True,
+        )
+        self.client.publish(
+            f"{BASE_TOPIC}/layout/state",
+            str(payload["panel_count"]),
+            retain=True,
+        )
+
+    def build_layout_svg(self, state_snapshot: Optional[Dict[int, dict]] = None) -> str:
+        state_source = state_snapshot or self.state
+        radius = infer_panel_radius(self.panels)
+
+        panel_shapes = []
+        all_points: List[Tuple[float, float]] = []
+
+        for panel in self.panels:
+            points = panel_polygon_points(panel, radius)
+            all_points.extend(points)
+            panel_shapes.append((panel, points))
+
+        if all_points:
+            min_x = min(x for x, _ in all_points) - LAYOUT_PREVIEW_PADDING
+            max_x = max(x for x, _ in all_points) + LAYOUT_PREVIEW_PADDING
+            min_y = min(y for _, y in all_points) - LAYOUT_PREVIEW_PADDING
+            max_y = max(y for _, y in all_points) + LAYOUT_PREVIEW_PADDING
+        else:
+            min_x = min_y = 0
+            max_x = max_y = 100
+
+        width = max(1.0, max_x - min_x)
+        height = max(1.0, max_y - min_y)
+        font_size = max(8.0, radius * 0.22)
+        escaped_name = html.escape(DEVICE_NAME)
+
+        parts = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            (
+                f'<svg xmlns="http://www.w3.org/2000/svg" '
+                f'viewBox="{min_x:.3f} {min_y:.3f} {width:.3f} {height:.3f}" '
+                f'width="{width:.0f}" height="{height:.0f}" '
+                f'role="img" aria-label="{escaped_name} panel preview">'
+            ),
+            f'<rect x="{min_x:.3f}" y="{min_y:.3f}" width="{width:.3f}" height="{height:.3f}" fill="{html.escape(LAYOUT_PREVIEW_BACKGROUND)}"/>',
+        ]
+
+        for panel, points in panel_shapes:
+            state = normalise_panel_state(state_source.get(panel.panel_id, default_panel_state()))
+            fill = svg_colour_for_panel_state(state)
+            text_colour = panel_text_colour(state)
+            point_text = " ".join(f"{x:.3f},{y:.3f}" for x, y in points)
+            center_x = float(panel.x)
+            center_y = float(-panel.y)
+            panel_id_text = html.escape(str(panel.panel_id))
+            shape_name = html.escape(shape_kind_for_type(panel.shape_type))
+
+            parts.append(
+                f'<g id="panel-{panel.panel_id}" data-panel-id="{panel.panel_id}" '
+                f'data-shape-type="{html.escape(str(panel.shape_type))}" '
+                f'data-shape="{shape_name}" data-orientation="{panel.orientation}">'
+            )
+            parts.append(
+                f'<title>Panel {panel_id_text}</title>'
+            )
+            parts.append(
+                f'<polygon points="{point_text}" fill="{fill}" '
+                f'stroke="{html.escape(LAYOUT_PREVIEW_STROKE)}" stroke-width="3" '
+                f'stroke-linejoin="round"/>'
+            )
+
+            if LAYOUT_PREVIEW_LABELS:
+                parts.append(
+                    f'<text x="{center_x:.3f}" y="{center_y:.3f}" '
+                    f'font-family="-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" '
+                    f'font-size="{font_size:.2f}" font-weight="700" '
+                    f'text-anchor="middle" dominant-baseline="central" '
+                    f'fill="{text_colour}">{panel_id_text}</text>'
+                )
+
+            parts.append('</g>')
+
+        parts.append('</svg>')
+        return "".join(parts)
+
+    def schedule_preview_publish(self, immediate: bool = False):
+        if not ENABLE_LAYOUT_PREVIEW:
+            return
+
+        if immediate or LAYOUT_PREVIEW_DEBOUNCE_SECONDS == 0:
+            self.publish_preview_image()
+            return
+
+        with self.lock:
+            if self.preview_timer is not None:
+                self.preview_timer.cancel()
+
+            self.preview_timer = threading.Timer(
+                LAYOUT_PREVIEW_DEBOUNCE_SECONDS,
+                self.publish_preview_image,
+            )
+            self.preview_timer.daemon = True
+            self.preview_timer.start()
+
+    def publish_preview_image(self):
+        if not ENABLE_LAYOUT_PREVIEW:
+            return
+
+        with self.lock:
+            self.preview_timer = None
+            state_snapshot = copy.deepcopy(self.state)
+
+        try:
+            svg = self.build_layout_svg(state_snapshot)
+        except Exception as exc:
+            print(f"Could not render layout preview SVG: {exc}")
+            return
+
+        self.client.publish(
+            f"{BASE_TOPIC}/preview/image",
+            svg.encode("utf-8"),
+            retain=True,
+        )
+        self.client.publish(
+            f"{BASE_TOPIC}/preview/state",
+            str(int(time.time())),
+            retain=True,
+        )
+
+    # ----------------------------
     # MQTT discovery and state
     # ----------------------------
 
@@ -1982,6 +2344,8 @@ class NanoleafBridge:
                 "x": panel.x,
                 "y": panel.y,
                 "shape_type": panel.shape_type,
+                "shape": shape_kind_for_type(panel.shape_type),
+                "orientation": panel.orientation,
             }
 
             self.client.publish(
@@ -2033,11 +2397,44 @@ class NanoleafBridge:
                 retain=True,
             )
 
+        layout_sensor_config = {
+            "name": "Layout",
+            "unique_id": f"{DEVICE_ID}_layout",
+            "state_topic": f"{BASE_TOPIC}/layout/state",
+            "json_attributes_topic": f"{BASE_TOPIC}/layout",
+            "availability_topic": f"{BASE_TOPIC}/status",
+            "device": device,
+            "icon": "mdi:vector-polygon",
+        }
+
+        self.client.publish(
+            f"{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}_layout/config",
+            json.dumps(layout_sensor_config),
+            retain=True,
+        )
+
+        if ENABLE_LAYOUT_PREVIEW:
+            preview_config = {
+                "name": "Panel Preview",
+                "unique_id": f"{DEVICE_ID}_panel_preview",
+                "image_topic": f"{BASE_TOPIC}/preview/image",
+                "content_type": "image/svg+xml",
+                "availability_topic": f"{BASE_TOPIC}/status",
+                "device": device,
+                "icon": "mdi:image-filter-center-focus",
+            }
+
+            self.client.publish(
+                f"{DISCOVERY_PREFIX}/image/{DEVICE_ID}_panel_preview/config",
+                json.dumps(preview_config),
+                retain=True,
+            )
+
         self.publish_global_attributes()
 
         print(
             f"Published MQTT discovery for {len(self.panels)} panels, "
-            f"{len(self.zones)} zones, plus whole-light entity"
+            f"{len(self.zones)} zones, plus whole-light, layout, and preview entities"
         )
 
     def publish_all_states(self):
@@ -2048,6 +2445,7 @@ class NanoleafBridge:
             self.publish_zone_state(zone)
 
         self.publish_whole_state()
+        self.schedule_preview_publish()
 
     def state_for_mqtt(self, state: dict) -> dict:
         normalised = normalise_panel_state(state)
@@ -2265,6 +2663,9 @@ class NanoleafBridge:
                     }
                     for zone in self.zones
                 ],
+                "layout_topic": f"{BASE_TOPIC}/layout",
+                "preview_image_topic": f"{BASE_TOPIC}/preview/image",
+                "layout_preview_enabled": ENABLE_LAYOUT_PREVIEW,
             }
 
         self.client.publish(
@@ -2290,7 +2691,8 @@ def main():
     for panel in panels:
         print(
             f"  Panel {panel.panel_id}: "
-            f"x={panel.x}, y={panel.y}, shape_type={panel.shape_type}"
+            f"x={panel.x}, y={panel.y}, shape_type={panel.shape_type}, "
+            f"orientation={panel.orientation}"
         )
 
     zones = load_zones_from_options({panel.panel_id for panel in panels})
