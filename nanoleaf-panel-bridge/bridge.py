@@ -315,6 +315,12 @@ class Zone:
     zone_id: str
     name: str
     panel_ids: List[int]
+    # Scales brightness commands sent to this zone.
+    # 1.0 = unchanged, 0.5 = half brightness.
+    brightness_multiplier: float = 1.0
+    # Hard cap after scaling, in Home Assistant brightness units.
+    # 255 = no cap, 128 = about 50%.
+    max_brightness: int = 255
 
 
 def slugify_identifier(value: str) -> str:
@@ -373,6 +379,52 @@ def parse_panel_ids(raw_value: Any) -> List[int]:
     return result
 
 
+def parse_zone_brightness_multiplier(raw_value: Any) -> float:
+    if raw_value in (None, ""):
+        return 1.0
+
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        print(f"Ignoring invalid zone brightness_multiplier: {raw_value!r}")
+        return 1.0
+
+    # Accept either 0.5 style or 50 style percentage input.
+    if value > 1.0 and value <= 100.0:
+        value = value / 100.0
+
+    return max(0.0, min(1.0, value))
+
+
+def parse_zone_max_brightness(raw_value: Any) -> int:
+    if raw_value in (None, ""):
+        return 255
+
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        print(f"Ignoring invalid zone max_brightness: {raw_value!r}")
+        return 255
+
+    # Accept 0.0-1.0 as a fraction, 1-100 as a percentage, or 0-255 as HA brightness.
+    if 0.0 <= value <= 1.0:
+        value = value * 255.0
+    elif 1.0 < value <= 100.0:
+        value = (value / 100.0) * 255.0
+
+    return bounded_int(value, minimum=0, maximum=255)
+
+
+def zone_effective_max_brightness(zone: Zone) -> int:
+    multiplier_cap = bounded_int(255 * zone.brightness_multiplier, minimum=0, maximum=255)
+    return min(zone.max_brightness, multiplier_cap)
+
+
+def scale_zone_brightness(zone: Zone, brightness: int | float) -> int:
+    scaled = float(clamp(brightness)) * zone.brightness_multiplier
+    return bounded_int(scaled, minimum=0, maximum=zone.max_brightness)
+
+
 def load_zones_from_options(valid_panel_ids: set[int]) -> List[Zone]:
     raw_zones = ADDON_OPTIONS.get("zones", [])
 
@@ -422,8 +474,23 @@ def load_zones_from_options(valid_panel_ids: set[int]) -> List[Zone]:
             print(f"Ignoring zone '{name}' because it has no valid panels")
             continue
 
+        brightness_multiplier = parse_zone_brightness_multiplier(
+            item.get("brightness_multiplier", item.get("brightness_scale", item.get("multiplier")))
+        )
+        max_brightness = parse_zone_max_brightness(
+            item.get("max_brightness", item.get("brightness_max"))
+        )
+
         used_ids.add(zone_id)
-        zones.append(Zone(zone_id=zone_id, name=name, panel_ids=panel_ids))
+        zones.append(
+            Zone(
+                zone_id=zone_id,
+                name=name,
+                panel_ids=panel_ids,
+                brightness_multiplier=brightness_multiplier,
+                max_brightness=max_brightness,
+            )
+        )
 
     return zones
 
@@ -843,11 +910,47 @@ class NanoleafBridge:
         self.publish_global_attributes()
         self.schedule_render()
 
+    def scaled_zone_payload(self, zone: Zone, payload: dict) -> dict:
+        """Return a copy of a zone command with brightness limited for this zone.
+
+        diyHue/Hue Sync can keep sending full-brightness updates. Applying the
+        multiplier here means the Nanoleaf panels are dimmed without changing
+        the colour data or relying on the Hue app brightness balancer.
+        """
+        adjusted = copy.deepcopy(payload)
+
+        if "brightness" in adjusted:
+            adjusted["brightness"] = scale_zone_brightness(zone, adjusted["brightness"])
+        elif "bri" in adjusted:
+            # Convert Hue 1-254 brightness into HA 0-255, then scale it.
+            try:
+                brightness_255 = (float(adjusted["bri"]) / 254.0) * 255.0
+                adjusted["brightness"] = scale_zone_brightness(zone, brightness_255)
+                adjusted.pop("bri", None)
+            except (TypeError, ValueError):
+                pass
+
+        return adjusted
+
+    def enforce_zone_brightness_limit(self, zone: Zone, panel_id: int):
+        """Clamp existing panel brightness so colour-only zone commands stay dim."""
+        if panel_id not in self.state:
+            return
+
+        panel_state = normalise_panel_state(self.state[panel_id])
+        panel_state["brightness"] = min(
+            panel_state["brightness"],
+            zone_effective_max_brightness(zone),
+        )
+        self.state[panel_id] = panel_state
+
     def handle_zone_command(self, zone_id: str, payload: dict):
         zone = self.zones_by_id.get(zone_id)
         if zone is None:
             print(f"Ignoring command for unknown zone {zone_id}")
             return
+
+        adjusted_payload = self.scaled_zone_payload(zone, payload)
 
         with self.lock:
             for panel_id in zone.panel_ids:
@@ -855,7 +958,8 @@ class NanoleafBridge:
                     print(f"Ignoring zone panel {panel_id}; not in current Nanoleaf layout")
                     continue
 
-                self.apply_payload_to_panel(panel_id, payload)
+                self.apply_payload_to_panel(panel_id, adjusted_payload)
+                self.enforce_zone_brightness_limit(zone, panel_id)
 
             # Any zone command exits native Nanoleaf effect mode.
             self.active_effect = None
@@ -1918,6 +2022,9 @@ class NanoleafBridge:
                 "zone_id": zone.zone_id,
                 "panel_ids": zone.panel_ids,
                 "panel_count": len(zone.panel_ids),
+                "brightness_multiplier": zone.brightness_multiplier,
+                "max_brightness": zone.max_brightness,
+                "effective_max_brightness": zone_effective_max_brightness(zone),
             }
 
             self.client.publish(
@@ -2152,6 +2259,9 @@ class NanoleafBridge:
                         "id": zone.zone_id,
                         "name": zone.name,
                         "panel_ids": zone.panel_ids,
+                        "brightness_multiplier": zone.brightness_multiplier,
+                        "max_brightness": zone.max_brightness,
+                        "effective_max_brightness": zone_effective_max_brightness(zone),
                     }
                     for zone in self.zones
                 ],
@@ -2187,7 +2297,12 @@ def main():
     if zones:
         print("Configured zones:")
         for zone in zones:
-            print(f"  {zone.zone_id} ({zone.name}): {zone.panel_ids}")
+            print(
+                f"  {zone.zone_id} ({zone.name}): {zone.panel_ids} "
+                f"brightness_multiplier={zone.brightness_multiplier}, "
+                f"max_brightness={zone.max_brightness}, "
+                f"effective_max={zone_effective_max_brightness(zone)}"
+            )
     else:
         print("No configured zones; only All Panels and individual panel lights will be exposed")
 
