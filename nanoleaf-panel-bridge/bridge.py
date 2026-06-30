@@ -3,6 +3,7 @@ import html
 import json
 import math
 import os
+import random
 import socket
 import struct
 import sys
@@ -269,6 +270,50 @@ ENABLE_NANOLEAF_EFFECTS = config_bool(
 )
 BRIDGE_EFFECT_NAME = str(
     config_value("bridge_effect_name", "BRIDGE_EFFECT_NAME", "Bridge Framebuffer")
+)
+
+# Bridge-side pseudo effects. These are rendered by bridge.py using the
+# framebuffer colours rather than selecting a native Nanoleaf scene.
+ENABLE_BRIDGE_EFFECTS = config_bool(
+    "enable_bridge_effects",
+    "ENABLE_BRIDGE_EFFECTS",
+    True,
+)
+SPARKLE_EFFECT_NAME = str(
+    config_value("sparkle_effect_name", "SPARKLE_EFFECT_NAME", "Bridge Sparkle")
+)
+SPARKLE_INTERVAL_SECONDS = config_float(
+    "sparkle_interval_seconds",
+    "SPARKLE_INTERVAL_SECONDS",
+    0.12,
+    minimum=0.02,
+    maximum=10.0,
+)
+SPARKLE_MIN_MULTIPLIER = config_float(
+    "sparkle_min_multiplier",
+    "SPARKLE_MIN_MULTIPLIER",
+    0.35,
+    minimum=0.0,
+    maximum=1.0,
+)
+SPARKLE_MAX_MULTIPLIER = config_float(
+    "sparkle_max_multiplier",
+    "SPARKLE_MAX_MULTIPLIER",
+    1.0,
+    minimum=0.0,
+    maximum=1.0,
+)
+if SPARKLE_MAX_MULTIPLIER < SPARKLE_MIN_MULTIPLIER:
+    SPARKLE_MIN_MULTIPLIER, SPARKLE_MAX_MULTIPLIER = (
+        SPARKLE_MAX_MULTIPLIER,
+        SPARKLE_MIN_MULTIPLIER,
+    )
+SPARKLE_SMOOTHING = config_float(
+    "sparkle_smoothing",
+    "SPARKLE_SMOOTHING",
+    0.65,
+    minimum=0.0,
+    maximum=0.99,
 )
 
 # extControl streaming options
@@ -855,6 +900,13 @@ class NanoleafBridge:
         self.effects: List[str] = []
         self.active_effect: Optional[str] = None
 
+        # Bridge-side pseudo effects, such as brightness-only sparkle.
+        # These do not overwrite self.state; they are applied as a render-time
+        # overlay so the selected base colours remain editable.
+        self.bridge_effect: Optional[str] = None
+        self.sparkle_multipliers: Dict[int, float] = {}
+        self.sparkle_next_update = 0.0
+
         self.load_state()
 
         self.client = mqtt.Client(
@@ -882,6 +934,7 @@ class NanoleafBridge:
     def start(self):
         print(f"Output mode: {'stream/extControl' if USE_STREAMING else 'rest'}")
         print(f"Effects enabled: {ENABLE_NANOLEAF_EFFECTS}")
+        print(f"Bridge effects enabled: {ENABLE_BRIDGE_EFFECTS}")
         print(f"Connecting to MQTT broker {MQTT_HOST}:{MQTT_PORT}")
 
         self.client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
@@ -1018,14 +1071,20 @@ class NanoleafBridge:
         if ENABLE_NANOLEAF_EFFECTS and "effect" in payload:
             effect_name = str(payload["effect"])
 
-            if effect_name and effect_name != BRIDGE_EFFECT_NAME:
-                self.handle_effect_command(effect_name, payload)
-                return
-
             if effect_name == BRIDGE_EFFECT_NAME:
                 print("Switching All Panels back to bridge framebuffer mode")
                 with self.lock:
                     self.active_effect = None
+                    self.bridge_effect = None
+                    self.sparkle_multipliers.clear()
+
+            elif self.is_bridge_effect_name(effect_name):
+                self.handle_bridge_effect_command(effect_name, payload)
+                return
+
+            elif effect_name:
+                self.handle_effect_command(effect_name, payload)
+                return
 
         # Fix for native scenes/effects:
         # While a native Nanoleaf effect is active, brightness/on/off commands
@@ -1134,6 +1193,47 @@ class NanoleafBridge:
         self.schedule_preview_publish()
         self.schedule_render()
 
+    def is_bridge_effect_name(self, effect_name: Optional[str]) -> bool:
+        if not ENABLE_BRIDGE_EFFECTS or not effect_name:
+            return False
+
+        return str(effect_name) == SPARKLE_EFFECT_NAME
+
+    def handle_bridge_effect_command(self, effect_name: str, payload: dict):
+        if not self.is_bridge_effect_name(effect_name):
+            return
+
+        payload_without_effect = {
+            key: value for key, value in payload.items() if key != "effect"
+        }
+
+        with self.lock:
+            # Bridge pseudo effects and native Nanoleaf effects are mutually
+            # exclusive. Sparkle keeps the existing framebuffer colours and only
+            # varies brightness as a render-time overlay.
+            self.active_effect = None
+            self.bridge_effect = effect_name
+            self.sparkle_multipliers.clear()
+            self.sparkle_next_update = 0.0
+
+            if payload_without_effect:
+                for panel_id in self.panel_ids:
+                    self.apply_payload_to_panel(panel_id, payload_without_effect)
+
+            self.update_optimistic_device_power_from_framebuffer()
+            self.save_state()
+
+        if not USE_STREAMING:
+            print(
+                f"{effect_name} works best with output_mode=stream; "
+                "REST mode can only render static sparkle frames."
+            )
+
+        self.publish_all_states()
+        self.publish_global_attributes()
+        self.schedule_preview_publish()
+        self.schedule_render()
+
     def handle_effect_command(self, effect_name: str, payload: dict):
         if effect_name not in self.effects:
             print(
@@ -1142,6 +1242,11 @@ class NanoleafBridge:
 
         # Native Nanoleaf effect mode and bridge streaming mode are mutually exclusive.
         self.stop_streaming()
+
+        with self.lock:
+            self.bridge_effect = None
+            self.sparkle_multipliers.clear()
+            self.sparkle_next_update = 0.0
 
         if "state" in payload and str(payload["state"]).upper() == "OFF":
             self.set_global_nanoleaf_state(on=False)
@@ -1524,9 +1629,16 @@ class NanoleafBridge:
     def get_effect_list_for_ha(self) -> List[str]:
         effects = [BRIDGE_EFFECT_NAME]
 
+        if ENABLE_BRIDGE_EFFECTS and SPARKLE_EFFECT_NAME not in effects:
+            effects.append(SPARKLE_EFFECT_NAME)
+
         with self.lock:
             active_effect = self.active_effect
+            bridge_effect = self.bridge_effect
             cached_effects = list(self.effects)
+
+        if bridge_effect and bridge_effect not in effects:
+            effects.append(bridge_effect)
 
         for effect in cached_effects:
             if effect and effect not in effects:
@@ -1663,11 +1775,16 @@ class NanoleafBridge:
             selected = None
 
         with self.lock:
-            # If bridge streaming is active, keep reporting Bridge Framebuffer.
+            # If bridge streaming is active, keep reporting the active bridge
+            # framebuffer/effect rather than a native Nanoleaf extControl effect.
             if self.is_streaming_locked():
                 self.active_effect = None
             else:
                 self.active_effect = selected
+                if selected:
+                    self.bridge_effect = None
+                    self.sparkle_multipliers.clear()
+                    self.sparkle_next_update = 0.0
 
         if publish:
             self.publish_whole_state()
@@ -1731,7 +1848,8 @@ class NanoleafBridge:
     # ----------------------------
 
     def render_to_nanoleaf_rest(self, state_snapshot: Optional[Dict[int, dict]] = None):
-        state_source = state_snapshot or self.state
+        state_source = copy.deepcopy(state_snapshot or self.state)
+        state_source = self.apply_bridge_effect_to_snapshot(state_source)
 
         desired_on_panels = [
             panel_id
@@ -1831,7 +1949,8 @@ class NanoleafBridge:
     def render_to_nanoleaf_stream(
         self, state_snapshot: Optional[Dict[int, dict]] = None
     ):
-        state_source = state_snapshot or self.state
+        state_source = copy.deepcopy(state_snapshot or self.state)
+        state_source = self.apply_bridge_effect_to_snapshot(state_source)
 
         desired_on_panels = [
             panel_id
@@ -2001,6 +2120,7 @@ class NanoleafBridge:
                 if not self.snapshot_has_on_panels(state_snapshot):
                     break
 
+                state_snapshot = self.apply_bridge_effect_to_snapshot(state_snapshot)
                 packet = self.build_extcontrol_packet(state_snapshot)
                 sock.sendto(packet, (NANOLEAF_IP, EXTCONTROL_PORT))
 
@@ -2027,6 +2147,66 @@ class NanoleafBridge:
                 self.stream_thread = None
 
         print("Nanoleaf UDP stream loop exited")
+
+    def apply_bridge_effect_to_snapshot(
+        self,
+        state_snapshot: Dict[int, dict],
+    ) -> Dict[int, dict]:
+        with self.lock:
+            bridge_effect = self.bridge_effect
+
+        if bridge_effect == SPARKLE_EFFECT_NAME:
+            return self.apply_sparkle_effect_to_snapshot(state_snapshot)
+
+        return state_snapshot
+
+    def apply_sparkle_effect_to_snapshot(
+        self,
+        state_snapshot: Dict[int, dict],
+    ) -> Dict[int, dict]:
+        now = time.monotonic()
+
+        with self.lock:
+            should_update = now >= self.sparkle_next_update
+
+            if should_update:
+                smoothing = SPARKLE_SMOOTHING
+                step = 1.0 - smoothing
+
+                for panel_id in self.panel_ids:
+                    panel_state = normalise_panel_state(
+                        state_snapshot.get(panel_id, default_panel_state())
+                    )
+
+                    if panel_state["state"] != "ON":
+                        self.sparkle_multipliers.pop(panel_id, None)
+                        continue
+
+                    target = random.uniform(
+                        SPARKLE_MIN_MULTIPLIER,
+                        SPARKLE_MAX_MULTIPLIER,
+                    )
+                    current = self.sparkle_multipliers.get(panel_id, target)
+                    self.sparkle_multipliers[panel_id] = (
+                        current + ((target - current) * step)
+                    )
+
+                self.sparkle_next_update = now + SPARKLE_INTERVAL_SECONDS
+
+            multipliers = dict(self.sparkle_multipliers)
+
+        for panel_id, multiplier in multipliers.items():
+            if panel_id not in state_snapshot:
+                continue
+
+            panel_state = normalise_panel_state(state_snapshot[panel_id])
+            if panel_state["state"] != "ON":
+                continue
+
+            panel_state["brightness"] = clamp(panel_state["brightness"] * multiplier)
+            state_snapshot[panel_id] = panel_state
+
+        return state_snapshot
 
     def snapshot_has_on_panels(self, state_snapshot: Dict[int, dict]) -> bool:
         return any(
@@ -2155,7 +2335,8 @@ class NanoleafBridge:
         )
 
     def build_layout_svg(self, state_snapshot: Optional[Dict[int, dict]] = None) -> str:
-        state_source = state_snapshot or self.state
+        state_source = copy.deepcopy(state_snapshot or self.state)
+        state_source = self.apply_bridge_effect_to_snapshot(state_source)
         radius = infer_panel_radius(self.panels)
 
         panel_shapes = []
@@ -2550,6 +2731,8 @@ class NanoleafBridge:
             device_power_on = self.device_power_on
             device_brightness = self.device_brightness
             active_effect = self.active_effect
+            bridge_effect = self.bridge_effect
+            reported_effect = active_effect or bridge_effect or BRIDGE_EFFECT_NAME
             state_values = [
                 normalise_panel_state(state) for state in self.state.values()
             ]
@@ -2564,7 +2747,7 @@ class NanoleafBridge:
                 "b": 255,
             },
             "transition": STREAM_TRANSITION_TIME,
-            "effect": active_effect or BRIDGE_EFFECT_NAME,
+            "effect": reported_effect,
         }
 
         if PUBLISH_EFFECTIVE_OFF_WHEN_GLOBAL_OFF and device_power_on is False:
@@ -2624,7 +2807,7 @@ class NanoleafBridge:
                     "brightness": brightness,
                     "color": color,
                     "transition": bounded_int(transition, minimum=0, maximum=65535),
-                    "effect": BRIDGE_EFFECT_NAME,
+                    "effect": reported_effect,
                 }
 
         self.client.publish(
@@ -2648,7 +2831,15 @@ class NanoleafBridge:
                 "global_brightness_value": GLOBAL_BRIGHTNESS_VALUE,
                 "sync_global_state": SYNC_GLOBAL_STATE,
                 "effects_enabled": ENABLE_NANOLEAF_EFFECTS,
-                "active_effect": self.active_effect or BRIDGE_EFFECT_NAME,
+                "active_effect": self.active_effect or self.bridge_effect or BRIDGE_EFFECT_NAME,
+                "native_effect": self.active_effect,
+                "bridge_effect": self.bridge_effect,
+                "bridge_effects_enabled": ENABLE_BRIDGE_EFFECTS,
+                "sparkle_effect_name": SPARKLE_EFFECT_NAME,
+                "sparkle_interval_seconds": SPARKLE_INTERVAL_SECONDS,
+                "sparkle_min_multiplier": SPARKLE_MIN_MULTIPLIER,
+                "sparkle_max_multiplier": SPARKLE_MAX_MULTIPLIER,
+                "sparkle_smoothing": SPARKLE_SMOOTHING,
                 "effect_count": len(self.effects),
                 "effects": self.get_effect_list_for_ha(),
                 "zone_count": len(self.zones),
