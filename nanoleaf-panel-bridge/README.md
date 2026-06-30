@@ -58,6 +58,12 @@ render_on_startup: false
 global_brightness_value: 100
 sync_global_state: true
 global_sync_interval_seconds: 5
+enable_bridge_effects: true
+sparkle_effect_name: Sparkle
+sparkle_interval_seconds: float
+sparkle_min_multiplier: float
+sparkle_max_multiplier: float
+sparkle_smoothing: float
 layout_preview_debounce_seconds: float
 layout_preview_padding: true
 layout_preview_labels: ture
