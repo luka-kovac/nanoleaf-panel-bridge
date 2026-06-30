@@ -678,7 +678,7 @@ def panel_polygon_points(panel: Panel, radius: float) -> List[Tuple[float, float
     if shape_kind == "square":
         return regular_polygon_points(center_x, center_y, radius * 0.92, 4, 45 + orientation)
 
-    return regular_polygon_points(center_x, center_y, radius, 6, 30 + orientation)
+    return regular_polygon_points(center_x, center_y, radius, 6, 0 + orientation)
 
 
 def svg_colour_for_panel_state(state: dict) -> str:
