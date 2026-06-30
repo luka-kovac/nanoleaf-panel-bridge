@@ -376,6 +376,29 @@ LAYOUT_PREVIEW_STROKE = str(
     config_value("layout_preview_stroke", "LAYOUT_PREVIEW_STROKE", "#d7dde5")
 )
 
+# Painter brush light. This is an MQTT-discovered helper light that does not
+# control the Nanoleaf directly. A dashboard can use Home Assistant's native
+# light colour/brightness picker on this entity, and a custom painter card can
+# read its state as the current brush.
+ENABLE_PAINTER_BRUSH = config_bool(
+    "enable_painter_brush",
+    "ENABLE_PAINTER_BRUSH",
+    True,
+)
+PAINTER_BRUSH_NAME = str(
+    config_value("painter_brush_name", "PAINTER_BRUSH_NAME", "Panel Painter Brush")
+)
+PAINTER_BRUSH_DEFAULT_BRIGHTNESS = config_int(
+    "painter_brush_default_brightness",
+    "PAINTER_BRUSH_DEFAULT_BRIGHTNESS",
+    200,
+    minimum=1,
+    maximum=255,
+)
+PAINTER_BRUSH_DEFAULT_COLOR = str(
+    config_value("painter_brush_default_color", "PAINTER_BRUSH_DEFAULT_COLOR", "#ff66cc")
+)
+
 
 # ----------------------------
 # Data model
@@ -768,6 +791,47 @@ def default_panel_state() -> dict:
     }
 
 
+def rgb_from_hex(value: str, fallback: str = "#ff66cc") -> dict:
+    text = str(value or fallback).strip()
+    if text.startswith("#"):
+        text = text[1:]
+    if len(text) == 3:
+        text = "".join(ch * 2 for ch in text)
+    if len(text) != 6:
+        text = str(fallback).strip().lstrip("#")
+
+    try:
+        return {
+            "r": int(text[0:2], 16),
+            "g": int(text[2:4], 16),
+            "b": int(text[4:6], 16),
+        }
+    except Exception:
+        return {"r": 255, "g": 102, "b": 204}
+
+
+def rendered_color_for_state(state: dict) -> dict:
+    state = normalise_panel_state(state)
+    if state["state"] != "ON":
+        return {"r": 0, "g": 0, "b": 0}
+
+    brightness = state["brightness"] / 255.0
+    color = state["color"]
+    return {
+        "r": clamp(color["r"] * brightness),
+        "g": clamp(color["g"] * brightness),
+        "b": clamp(color["b"] * brightness),
+    }
+
+
+def default_brush_state() -> dict:
+    state = default_panel_state()
+    state["state"] = "ON"
+    state["brightness"] = PAINTER_BRUSH_DEFAULT_BRIGHTNESS
+    state["color"] = rgb_from_hex(PAINTER_BRUSH_DEFAULT_COLOR)
+    return normalise_panel_state(state)
+
+
 def normalise_panel_state(value: dict, fallback: Optional[dict] = None) -> dict:
     if fallback is None:
         fallback = default_panel_state()
@@ -892,6 +956,10 @@ class NanoleafBridge:
             panel_id: default_panel_state() for panel_id in self.panel_ids
         }
 
+        # MQTT-discovered helper light used by the painter card as a native
+        # Home Assistant colour/brightness picker. It does not render by itself.
+        self.brush_state: dict = default_brush_state()
+
         # Nanoleaf whole-device state.
         self.device_power_on: Optional[bool] = None
         self.device_brightness: Optional[int] = None
@@ -983,6 +1051,8 @@ class NanoleafBridge:
         client.subscribe(f"{BASE_TOPIC}/set")
         client.subscribe(f"{BASE_TOPIC}/panel/+/set")
         client.subscribe(f"{BASE_TOPIC}/zone/+/set")
+        if ENABLE_PAINTER_BRUSH:
+            client.subscribe(f"{BASE_TOPIC}/brush/set")
         client.subscribe("homeassistant/status")
 
         if SYNC_GLOBAL_STATE:
@@ -1050,12 +1120,75 @@ class NanoleafBridge:
             elif topic.startswith(f"{BASE_TOPIC}/zone/") and topic.endswith("/set"):
                 zone_id = topic.split("/")[-2]
                 self.handle_zone_command(zone_id, payload)
+            elif topic == f"{BASE_TOPIC}/brush/set":
+                self.handle_brush_command(payload)
         except Exception as exc:
             print(f"Error handling MQTT command on {topic}: {exc}")
 
     # ----------------------------
     # Command handling
     # ----------------------------
+
+    def handle_brush_command(self, payload: dict):
+        if not ENABLE_PAINTER_BRUSH:
+            return
+
+        with self.lock:
+            self.apply_payload_to_brush(payload)
+
+        self.publish_brush_state()
+
+    def apply_payload_to_brush(self, payload: dict):
+        brush_state = self.brush_state
+
+        if "state" in payload:
+            state_value = str(payload["state"]).upper()
+            brush_state["state"] = "ON" if state_value == "ON" else "OFF"
+        elif "on" in payload:
+            brush_state["state"] = "ON" if bool(payload["on"]) else "OFF"
+
+        if "brightness" in payload:
+            brush_state["brightness"] = clamp(payload["brightness"])
+        elif "bri" in payload:
+            brush_state["brightness"] = bounded_int(
+                (float(payload["bri"]) / 254.0) * 255.0,
+                minimum=0,
+                maximum=255,
+            )
+
+        xy_value = None
+        try:
+            xy_value = extract_xy_from_payload(payload)
+        except (TypeError, ValueError) as exc:
+            print(f"Ignoring invalid brush xy colour payload: {payload!r}: {exc}")
+
+        if xy_value is not None:
+            x, y = xy_value
+            brush_state["color"] = xy_to_rgb(x, y)
+        elif "color" in payload:
+            color = payload["color"]
+            if isinstance(color, dict):
+                brush_state["color"] = {
+                    "r": clamp(color.get("r", brush_state["color"]["r"])),
+                    "g": clamp(color.get("g", brush_state["color"]["g"])),
+                    "b": clamp(color.get("b", brush_state["color"]["b"])),
+                }
+
+        if "transition" in payload:
+            try:
+                brush_state["transition"] = bounded_int(
+                    float(payload["transition"]) * 10,
+                    minimum=0,
+                    maximum=65535,
+                )
+            except (TypeError, ValueError):
+                print(f"Ignoring invalid brush transition value: {payload['transition']}")
+
+        if "brightness" in payload or "bri" in payload or "color" in payload or xy_value is not None:
+            brush_state["state"] = "ON"
+
+        brush_state["color_mode"] = "rgb"
+        self.brush_state = normalise_panel_state(brush_state)
 
     def handle_whole_light_command(self, payload: dict):
         """
@@ -1123,6 +1256,7 @@ class NanoleafBridge:
 
         self.publish_panel_state(panel_id)
         self.publish_whole_state()
+        self.publish_framebuffer_json()
         self.publish_global_attributes()
         self.schedule_preview_publish()
         self.schedule_render()
@@ -1189,6 +1323,7 @@ class NanoleafBridge:
             if panel_id in self.state:
                 self.publish_panel_state(panel_id)
         self.publish_whole_state()
+        self.publish_framebuffer_json()
         self.publish_global_attributes()
         self.schedule_preview_publish()
         self.schedule_render()
@@ -2334,6 +2469,56 @@ class NanoleafBridge:
             retain=True,
         )
 
+    def build_framebuffer_payload(self) -> dict:
+        with self.lock:
+            state_snapshot = copy.deepcopy(self.state)
+            device_power_on = self.device_power_on
+            active_effect = self.active_effect
+            bridge_effect = self.bridge_effect
+
+        panels = {}
+        for panel in self.panels:
+            state = normalise_panel_state(
+                state_snapshot.get(panel.panel_id, default_panel_state())
+            )
+            panels[str(panel.panel_id)] = {
+                "panel_id": panel.panel_id,
+                "state": state["state"],
+                "color_mode": state["color_mode"],
+                "brightness": state["brightness"],
+                "color": state["color"],
+                "rendered_color": rendered_color_for_state(state),
+                "transition": state["transition"],
+                "mqtt_command_topic": f"{BASE_TOPIC}/panel/{panel.panel_id}/set",
+                "mqtt_state_topic": f"{BASE_TOPIC}/panel/{panel.panel_id}/state",
+            }
+
+        return {
+            "device_id": DEVICE_ID,
+            "device_name": DEVICE_NAME,
+            "base_topic": BASE_TOPIC,
+            "panel_count": len(panels),
+            "updated_at": int(time.time()),
+            "nanoleaf_global_power": device_power_on,
+            "active_effect": active_effect,
+            "bridge_effect": bridge_effect,
+            "panels": panels,
+        }
+
+    def publish_framebuffer_json(self):
+        payload = self.build_framebuffer_payload()
+
+        self.client.publish(
+            f"{BASE_TOPIC}/framebuffer",
+            json.dumps(payload, separators=(",", ":")),
+            retain=True,
+        )
+        self.client.publish(
+            f"{BASE_TOPIC}/framebuffer/state",
+            str(payload["updated_at"]),
+            retain=True,
+        )
+
     def build_layout_svg(self, state_snapshot: Optional[Dict[int, dict]] = None) -> str:
         state_source = copy.deepcopy(state_snapshot or self.state)
         state_source = self.apply_bridge_effect_to_snapshot(state_source)
@@ -2594,6 +2779,45 @@ class NanoleafBridge:
             retain=True,
         )
 
+        framebuffer_sensor_config = {
+            "name": "Framebuffer",
+            "unique_id": f"{DEVICE_ID}_framebuffer",
+            "state_topic": f"{BASE_TOPIC}/framebuffer/state",
+            "json_attributes_topic": f"{BASE_TOPIC}/framebuffer",
+            "availability_topic": f"{BASE_TOPIC}/status",
+            "device": device,
+            "icon": "mdi:memory",
+        }
+
+        self.client.publish(
+            f"{DISCOVERY_PREFIX}/sensor/{DEVICE_ID}_framebuffer/config",
+            json.dumps(framebuffer_sensor_config),
+            retain=True,
+        )
+
+        if ENABLE_PAINTER_BRUSH:
+            brush_config = {
+                "name": PAINTER_BRUSH_NAME,
+                "unique_id": f"{DEVICE_ID}_painter_brush",
+                "schema": "json",
+                "command_topic": f"{BASE_TOPIC}/brush/set",
+                "state_topic": f"{BASE_TOPIC}/brush/state",
+                "json_attributes_topic": f"{BASE_TOPIC}/brush/attributes",
+                "availability_topic": f"{BASE_TOPIC}/status",
+                "brightness": True,
+                "supported_color_modes": ["rgb", "xy"],
+                "optimistic": False,
+                "device": device,
+                "icon": "mdi:brush-variant",
+            }
+
+            self.client.publish(
+                f"{DISCOVERY_PREFIX}/light/{DEVICE_ID}_painter_brush/config",
+                json.dumps(brush_config),
+                retain=True,
+            )
+            self.publish_brush_state()
+
         if ENABLE_LAYOUT_PREVIEW:
             preview_config = {
                 "name": "Panel Preview",
@@ -2615,7 +2839,8 @@ class NanoleafBridge:
 
         print(
             f"Published MQTT discovery for {len(self.panels)} panels, "
-            f"{len(self.zones)} zones, plus whole-light, layout, and preview entities"
+            f"{len(self.zones)} zones, plus whole-light, layout, framebuffer, "
+            "brush, and preview entities"
         )
 
     def publish_all_states(self):
@@ -2626,6 +2851,7 @@ class NanoleafBridge:
             self.publish_zone_state(zone)
 
         self.publish_whole_state()
+        self.publish_framebuffer_json()
         self.schedule_preview_publish()
 
     def state_for_mqtt(self, state: dict) -> dict:
@@ -2723,6 +2949,30 @@ class NanoleafBridge:
         self.client.publish(
             f"{BASE_TOPIC}/zone/{zone.zone_id}/state",
             payload,
+            retain=True,
+        )
+
+    def publish_brush_state(self):
+        if not ENABLE_PAINTER_BRUSH:
+            return
+
+        with self.lock:
+            brush_state = self.state_for_mqtt(self.brush_state)
+
+        self.client.publish(
+            f"{BASE_TOPIC}/brush/state",
+            json.dumps(brush_state),
+            retain=True,
+        )
+
+        attrs = {
+            "purpose": "Colour and brightness source for the Nanoleaf panel painter card",
+            "does_not_render_directly": True,
+            "framebuffer_topic": f"{BASE_TOPIC}/framebuffer",
+        }
+        self.client.publish(
+            f"{BASE_TOPIC}/brush/attributes",
+            json.dumps(attrs),
             retain=True,
         )
 
@@ -2855,8 +3105,12 @@ class NanoleafBridge:
                     for zone in self.zones
                 ],
                 "layout_topic": f"{BASE_TOPIC}/layout",
+                "framebuffer_topic": f"{BASE_TOPIC}/framebuffer",
                 "preview_image_topic": f"{BASE_TOPIC}/preview/image",
                 "layout_preview_enabled": ENABLE_LAYOUT_PREVIEW,
+                "painter_brush_enabled": ENABLE_PAINTER_BRUSH,
+                "painter_brush_name": PAINTER_BRUSH_NAME,
+                "painter_brush_command_topic": f"{BASE_TOPIC}/brush/set",
             }
 
         self.client.publish(

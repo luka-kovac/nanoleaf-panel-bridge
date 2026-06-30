@@ -1,5 +1,5 @@
 name: Nanoleaf Panel Bridge
-version: "0.1.8"
+version: "0.1.9"
 slug: nanoleaf_panel_bridge
 description: Expose Nanoleaf Shapes panels and configurable zones as MQTT lights
 startup: services
@@ -36,6 +36,10 @@ options:
   layout_preview_labels: true
   layout_preview_background: "#101418"
   layout_preview_stroke: "#d7dde5"
+  enable_painter_brush: true
+  painter_brush_name: "Panel Painter Brush"
+  painter_brush_default_brightness: 200
+  painter_brush_default_color: "#ff66cc"
   zones: []
 
 schema:
@@ -64,6 +68,10 @@ schema:
   layout_preview_labels: bool
   layout_preview_background: str
   layout_preview_stroke: str
+  enable_painter_brush: bool
+  painter_brush_name: str
+  painter_brush_default_brightness: int
+  painter_brush_default_color: str
   zones:
     - id: str
       name: str
