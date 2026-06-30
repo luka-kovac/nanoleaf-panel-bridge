@@ -1,5 +1,5 @@
 name: Nanoleaf Panel Bridge
-version: "0.1.6"
+version: "0.1.7"
 slug: nanoleaf_panel_bridge
 description: Expose Nanoleaf Shapes panels and configurable zones as MQTT lights
 startup: services
