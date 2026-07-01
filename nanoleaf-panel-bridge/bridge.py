@@ -236,6 +236,15 @@ GLOBAL_BRIGHTNESS_VALUE = config_int(
     maximum=100,
 )
 
+# When selecting native Nanoleaf effects or bridge pseudo-effects from Home
+# Assistant, preserve the last known Nanoleaf global brightness instead of
+# forcing effects back to GLOBAL_BRIGHTNESS_VALUE.
+REMEMBER_EFFECT_BRIGHTNESS = config_bool(
+    "remember_effect_brightness",
+    "REMEMBER_EFFECT_BRIGHTNESS",
+    True,
+)
+
 TURN_GLOBAL_OFF_WHEN_FRAME_EMPTY = config_bool(
     "turn_global_off_when_frame_empty",
     "TURN_GLOBAL_OFF_WHEN_FRAME_EMPTY",
@@ -1387,6 +1396,62 @@ class NanoleafBridge:
         self.schedule_preview_publish()
         self.schedule_render()
 
+    def remembered_nanoleaf_brightness(self) -> int:
+        """Return the best known Nanoleaf global brightness in 1-100 units."""
+        with self.lock:
+            brightness = self.device_brightness
+
+        if brightness is None:
+            return GLOBAL_BRIGHTNESS_VALUE
+
+        return bounded_int(brightness, minimum=1, maximum=100)
+
+    def brightness_from_effect_payload(self, payload: dict) -> Optional[int]:
+        """Resolve the brightness to use when selecting an effect.
+
+        Home Assistant may send no brightness when only the effect changes. In
+        that case, keep the Nanoleaf's last known global brightness so native
+        effects and bridge pseudo-effects do not jump back to 100%.
+        """
+        if "brightness" in payload:
+            # HA brightness is 0-255; Nanoleaf global brightness is 1-100.
+            return bounded_int(
+                (clamp(payload["brightness"]) / 255) * 100,
+                minimum=1,
+                maximum=100,
+            )
+
+        if "bri" in payload:
+            # Hue-style brightness is usually 1-254.
+            return bounded_int(
+                (float(payload["bri"]) / 254.0) * 100,
+                minimum=1,
+                maximum=100,
+            )
+
+        if REMEMBER_EFFECT_BRIGHTNESS:
+            return self.remembered_nanoleaf_brightness()
+
+        if FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
+            return GLOBAL_BRIGHTNESS_VALUE
+
+        return None
+
+    def global_brightness_for_render(self) -> Optional[int]:
+        """Return the global brightness to use before framebuffer rendering."""
+        if not FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
+            return None
+
+        with self.lock:
+            bridge_effect = self.bridge_effect
+
+        # For bridge pseudo-effects, changing or starting the effect should keep
+        # the last selected Nanoleaf brightness rather than snapping to 100%.
+        if REMEMBER_EFFECT_BRIGHTNESS and bridge_effect:
+            return self.remembered_nanoleaf_brightness()
+
+        return GLOBAL_BRIGHTNESS_VALUE
+
     def handle_effect_command(self, effect_name: str, payload: dict):
         if effect_name not in self.effects:
             print(
@@ -1407,17 +1472,7 @@ class NanoleafBridge:
             self.publish_global_attributes()
             return
 
-        brightness = None
-
-        if "brightness" in payload:
-            # HA brightness is 0-255; Nanoleaf global brightness is 1-100.
-            brightness = bounded_int(
-                (clamp(payload["brightness"]) / 255) * 100,
-                minimum=1,
-                maximum=100,
-            )
-        elif FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
-            brightness = GLOBAL_BRIGHTNESS_VALUE
+        brightness = self.brightness_from_effect_payload(payload)
 
         self.set_global_nanoleaf_state(
             on=True,
@@ -2022,12 +2077,11 @@ class NanoleafBridge:
                 return
 
         if FORCE_GLOBAL_ON_ON_RENDER or self.device_power_on is False:
-            brightness = (
-                GLOBAL_BRIGHTNESS_VALUE if FORCE_GLOBAL_BRIGHTNESS_ON_RENDER else None
-            )
+            brightness = self.global_brightness_for_render()
             self.set_global_nanoleaf_state(on=True, brightness=brightness)
         elif FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
-            self.set_global_nanoleaf_state(brightness=GLOBAL_BRIGHTNESS_VALUE)
+            brightness = self.global_brightness_for_render()
+            self.set_global_nanoleaf_state(brightness=brightness)
 
         parts = [str(len(self.panel_ids))]
 
@@ -2088,7 +2142,9 @@ class NanoleafBridge:
             self.device_power_on = True
             self.active_effect = None
             if FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
-                self.device_brightness = GLOBAL_BRIGHTNESS_VALUE
+                render_brightness = self.global_brightness_for_render()
+                if render_brightness is not None:
+                    self.device_brightness = render_brightness
 
         self.publish_all_states()
         self.publish_global_attributes()
@@ -2124,12 +2180,11 @@ class NanoleafBridge:
             return
 
         if FORCE_GLOBAL_ON_ON_RENDER or self.device_power_on is False:
-            brightness = (
-                GLOBAL_BRIGHTNESS_VALUE if FORCE_GLOBAL_BRIGHTNESS_ON_RENDER else None
-            )
+            brightness = self.global_brightness_for_render()
             self.set_global_nanoleaf_state(on=True, brightness=brightness)
         elif FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
-            self.set_global_nanoleaf_state(brightness=GLOBAL_BRIGHTNESS_VALUE)
+            brightness = self.global_brightness_for_render()
+            self.set_global_nanoleaf_state(brightness=brightness)
 
         with self.lock:
             self.active_effect = None
@@ -2139,7 +2194,9 @@ class NanoleafBridge:
         with self.lock:
             self.device_power_on = True
             if FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
-                self.device_brightness = GLOBAL_BRIGHTNESS_VALUE
+                render_brightness = self.global_brightness_for_render()
+                if render_brightness is not None:
+                    self.device_brightness = render_brightness
 
         self.publish_all_states()
         self.publish_global_attributes()
@@ -2254,16 +2311,11 @@ class NanoleafBridge:
                     or now - last_enabled >= EXTCONTROL_REENABLE_INTERVAL_SECONDS
                 ):
                     if FORCE_GLOBAL_ON_ON_RENDER:
-                        brightness = (
-                            GLOBAL_BRIGHTNESS_VALUE
-                            if FORCE_GLOBAL_BRIGHTNESS_ON_RENDER
-                            else None
-                        )
+                        brightness = self.global_brightness_for_render()
                         self.set_global_nanoleaf_state(on=True, brightness=brightness)
                     elif FORCE_GLOBAL_BRIGHTNESS_ON_RENDER:
-                        self.set_global_nanoleaf_state(
-                            brightness=GLOBAL_BRIGHTNESS_VALUE
-                        )
+                        brightness = self.global_brightness_for_render()
+                        self.set_global_nanoleaf_state(brightness=brightness)
 
                     self.enable_extcontrol()
 
@@ -3000,6 +3052,32 @@ class NanoleafBridge:
             retain=True,
         )
 
+    def whole_light_brightness_255(
+        self,
+        state_values: List[dict],
+        device_brightness: Optional[int],
+    ) -> int:
+        if device_brightness is not None:
+            return bounded_int(
+                (device_brightness / 100) * 255,
+                minimum=1,
+                maximum=255,
+            )
+
+        on_panels = [state for state in state_values if state["state"] == "ON"]
+        if on_panels:
+            return bounded_int(
+                sum(panel["brightness"] for panel in on_panels) / len(on_panels),
+                minimum=1,
+                maximum=255,
+            )
+
+        return bounded_int(
+            (GLOBAL_BRIGHTNESS_VALUE / 100) * 255,
+            minimum=1,
+            maximum=255,
+        )
+
     def publish_whole_state(self):
         with self.lock:
             device_power_on = self.device_power_on
@@ -3011,10 +3089,15 @@ class NanoleafBridge:
                 normalise_panel_state(state) for state in self.state.values()
             ]
 
+        remembered_brightness_255 = self.whole_light_brightness_255(
+            state_values,
+            device_brightness,
+        )
+
         off_state = {
             "state": "OFF",
             "color_mode": "rgb",
-            "brightness": 255,
+            "brightness": remembered_brightness_255,
             "color": {
                 "r": 255,
                 "g": 255,
@@ -3027,11 +3110,7 @@ class NanoleafBridge:
         if PUBLISH_EFFECTIVE_OFF_WHEN_GLOBAL_OFF and device_power_on is False:
             whole_state = off_state
         elif active_effect:
-            brightness_255 = 255
-            if device_brightness is not None:
-                brightness_255 = bounded_int(
-                    (device_brightness / 100) * 255, minimum=1, maximum=255
-                )
+            brightness_255 = remembered_brightness_255
 
             whole_state = {
                 "state": "ON",
@@ -3103,6 +3182,8 @@ class NanoleafBridge:
                 "force_global_on_on_render": FORCE_GLOBAL_ON_ON_RENDER,
                 "force_global_brightness_on_render": FORCE_GLOBAL_BRIGHTNESS_ON_RENDER,
                 "global_brightness_value": GLOBAL_BRIGHTNESS_VALUE,
+                "remember_effect_brightness": REMEMBER_EFFECT_BRIGHTNESS,
+                "remembered_nanoleaf_brightness": self.remembered_nanoleaf_brightness(),
                 "sync_global_state": SYNC_GLOBAL_STATE,
                 "effects_enabled": ENABLE_NANOLEAF_EFFECTS,
                 "active_effect": self.active_effect or self.bridge_effect or BRIDGE_EFFECT_NAME,
