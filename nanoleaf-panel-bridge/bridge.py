@@ -364,6 +364,20 @@ LAYOUT_PREVIEW_PADDING = config_int(
     minimum=0,
     maximum=500,
 )
+LAYOUT_PREVIEW_PANEL_RADIUS_MULTIPLIER = config_float(
+    "layout_preview_panel_radius_multiplier",
+    "LAYOUT_PREVIEW_PANEL_RADIUS_MULTIPLIER",
+    0.42,
+    minimum=0.05,
+    maximum=2.0,
+)
+LAYOUT_PREVIEW_MIN_PANEL_RADIUS = config_float(
+    "layout_preview_min_panel_radius",
+    "LAYOUT_PREVIEW_MIN_PANEL_RADIUS",
+    18.0,
+    minimum=1.0,
+    maximum=500.0,
+)
 LAYOUT_PREVIEW_LABELS = config_bool(
     "layout_preview_labels",
     "LAYOUT_PREVIEW_LABELS",
@@ -707,11 +721,15 @@ def infer_panel_radius(panels: List[Panel]) -> float:
                 distances.append(distance)
 
     if not distances:
-        return 50.0
+        return LAYOUT_PREVIEW_MIN_PANEL_RADIUS
 
-    # This is deliberately approximate. It creates a readable dashboard preview
-    # across mixed Shapes layouts without needing exact physical panel dimensions.
-    return max(18.0, min(distances) * 0.42)
+    # The multiplier controls how large each drawn panel is relative to the
+    # nearest Nanoleaf layout centre-to-centre distance. Increase it to reduce
+    # visual gaps between panels; decrease it to create more separation.
+    return max(
+        LAYOUT_PREVIEW_MIN_PANEL_RADIUS,
+        min(distances) * LAYOUT_PREVIEW_PANEL_RADIUS_MULTIPLIER,
+    )
 
 
 def regular_polygon_points(
@@ -2445,6 +2463,12 @@ class NanoleafBridge:
                 }
                 for zone in self.zones
             ],
+            "preview": {
+                "panel_radius": round(radius, 3),
+                "panel_radius_multiplier": LAYOUT_PREVIEW_PANEL_RADIUS_MULTIPLIER,
+                "min_panel_radius": LAYOUT_PREVIEW_MIN_PANEL_RADIUS,
+                "padding": LAYOUT_PREVIEW_PADDING,
+            },
             "bounds": {
                 "min_x": round(min_x, 3),
                 "max_x": round(max_x, 3),
@@ -3108,6 +3132,8 @@ class NanoleafBridge:
                 "framebuffer_topic": f"{BASE_TOPIC}/framebuffer",
                 "preview_image_topic": f"{BASE_TOPIC}/preview/image",
                 "layout_preview_enabled": ENABLE_LAYOUT_PREVIEW,
+                "layout_preview_panel_radius_multiplier": LAYOUT_PREVIEW_PANEL_RADIUS_MULTIPLIER,
+                "layout_preview_min_panel_radius": LAYOUT_PREVIEW_MIN_PANEL_RADIUS,
                 "painter_brush_enabled": ENABLE_PAINTER_BRUSH,
                 "painter_brush_name": PAINTER_BRUSH_NAME,
                 "painter_brush_command_topic": f"{BASE_TOPIC}/brush/set",
