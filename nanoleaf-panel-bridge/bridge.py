@@ -325,6 +325,32 @@ SPARKLE_SMOOTHING = config_float(
     maximum=0.99,
 )
 
+# Smooth Blaze-style sparkle settings. The old sparkle behaviour picked random
+# target brightness values at intervals, which can look jumpy. These settings
+# instead generate a continuous per-panel brightness wave so the effect moves
+# more like Nanoleaf's built-in Blaze scene.
+SPARKLE_BLAZE_SPEED = config_float(
+    "sparkle_blaze_speed",
+    "SPARKLE_BLAZE_SPEED",
+    0.45,
+    minimum=0.01,
+    maximum=5.0,
+)
+SPARKLE_BLAZE_SPATIAL_SCALE = config_float(
+    "sparkle_blaze_spatial_scale",
+    "SPARKLE_BLAZE_SPATIAL_SCALE",
+    0.010,
+    minimum=0.0,
+    maximum=0.2,
+)
+SPARKLE_BLAZE_SECONDARY_AMOUNT = config_float(
+    "sparkle_blaze_secondary_amount",
+    "SPARKLE_BLAZE_SECONDARY_AMOUNT",
+    0.35,
+    minimum=0.0,
+    maximum=1.0,
+)
+
 # extControl streaming options
 EXTCONTROL_PORT = config_int(
     "extcontrol_port",
@@ -2365,42 +2391,65 @@ class NanoleafBridge:
 
         return state_snapshot
 
+    def deterministic_unit_float(self, value: float) -> float:
+        """Return a stable pseudo-random value in the range 0.0-1.0.
+
+        This avoids picking new random targets every frame while still giving
+        each panel its own phase/speed character. The result is deterministic
+        across restarts for the same panel IDs.
+        """
+        raw = math.sin(value * 12.9898) * 43758.5453
+        return raw - math.floor(raw)
+
+    def blaze_sparkle_multiplier_for_panel(self, panel: Panel, now: float) -> float:
+        """Continuous Blaze-style brightness multiplier for one panel.
+
+        Instead of stepping between random brightness targets, combine two slow
+        sine waves with a stable per-panel phase and a small spatial offset.
+        This gives each panel organic movement while remaining smooth at the
+        extControl stream frame rate.
+        """
+        minimum = SPARKLE_MIN_MULTIPLIER
+        maximum = SPARKLE_MAX_MULTIPLIER
+        if maximum <= minimum:
+            return minimum
+
+        phase_one = self.deterministic_unit_float(panel.panel_id + 11.0) * math.tau
+        phase_two = self.deterministic_unit_float(panel.panel_id + 37.0) * math.tau
+
+        # Tiny stable speed variation prevents every panel from breathing in
+        # perfect lockstep. The global speed still controls the overall tempo.
+        speed_variation = 0.82 + (
+            self.deterministic_unit_float(panel.panel_id + 71.0) * 0.36
+        )
+        t = now * SPARKLE_BLAZE_SPEED * speed_variation * math.tau
+
+        spatial_offset = (
+            (float(panel.x) * SPARKLE_BLAZE_SPATIAL_SCALE)
+            + (float(-panel.y) * SPARKLE_BLAZE_SPATIAL_SCALE * 0.8)
+        )
+
+        secondary_amount = SPARKLE_BLAZE_SECONDARY_AMOUNT
+        primary = math.sin(t + phase_one + spatial_offset)
+        secondary = math.sin((t * 1.73) + phase_two - (spatial_offset * 0.6))
+        wave = (primary * (1.0 - secondary_amount)) + (secondary * secondary_amount)
+
+        # Convert -1..1 to 0..1 and apply smoothstep easing so peaks and troughs
+        # roll in/out like a flame rather than ticking like a random sparkle.
+        normalised = max(0.0, min(1.0, (wave + 1.0) * 0.5))
+        eased = normalised * normalised * (3.0 - (2.0 * normalised))
+
+        return minimum + ((maximum - minimum) * eased)
+
     def apply_sparkle_effect_to_snapshot(
         self,
         state_snapshot: Dict[int, dict],
     ) -> Dict[int, dict]:
         now = time.monotonic()
+        panel_by_id = {panel.panel_id: panel for panel in self.panels}
+        latest_multipliers: Dict[int, float] = {}
 
-        with self.lock:
-            should_update = now >= self.sparkle_next_update
-
-            if should_update:
-                smoothing = SPARKLE_SMOOTHING
-                step = 1.0 - smoothing
-
-                for panel_id in self.panel_ids:
-                    panel_state = normalise_panel_state(
-                        state_snapshot.get(panel_id, default_panel_state())
-                    )
-
-                    if panel_state["state"] != "ON":
-                        self.sparkle_multipliers.pop(panel_id, None)
-                        continue
-
-                    target = random.uniform(
-                        SPARKLE_MIN_MULTIPLIER,
-                        SPARKLE_MAX_MULTIPLIER,
-                    )
-                    current = self.sparkle_multipliers.get(panel_id, target)
-                    self.sparkle_multipliers[panel_id] = (
-                        current + ((target - current) * step)
-                    )
-
-                self.sparkle_next_update = now + SPARKLE_INTERVAL_SECONDS
-
-            multipliers = dict(self.sparkle_multipliers)
-
-        for panel_id, multiplier in multipliers.items():
+        for panel_id in self.panel_ids:
             if panel_id not in state_snapshot:
                 continue
 
@@ -2408,8 +2457,20 @@ class NanoleafBridge:
             if panel_state["state"] != "ON":
                 continue
 
+            panel = panel_by_id.get(panel_id)
+            if panel is None:
+                continue
+
+            multiplier = self.blaze_sparkle_multiplier_for_panel(panel, now)
+            latest_multipliers[panel_id] = multiplier
             panel_state["brightness"] = clamp(panel_state["brightness"] * multiplier)
             state_snapshot[panel_id] = panel_state
+
+        # Keep this populated for debugging/attributes without using it as the
+        # source of the animation. The animation itself is time-continuous.
+        with self.lock:
+            self.sparkle_multipliers = latest_multipliers
+            self.sparkle_next_update = now
 
         return state_snapshot
 
@@ -3195,6 +3256,9 @@ class NanoleafBridge:
                 "sparkle_min_multiplier": SPARKLE_MIN_MULTIPLIER,
                 "sparkle_max_multiplier": SPARKLE_MAX_MULTIPLIER,
                 "sparkle_smoothing": SPARKLE_SMOOTHING,
+                "sparkle_blaze_speed": SPARKLE_BLAZE_SPEED,
+                "sparkle_blaze_spatial_scale": SPARKLE_BLAZE_SPATIAL_SCALE,
+                "sparkle_blaze_secondary_amount": SPARKLE_BLAZE_SECONDARY_AMOUNT,
                 "effect_count": len(self.effects),
                 "effects": self.get_effect_list_for_ha(),
                 "zone_count": len(self.zones),
