@@ -10,9 +10,11 @@ Install as a repository in Home Assistant and install the App.
 
 Ensure you have an MQTT broker (tested with Mosquitto in HA).
 
-You will need to edit the config as YAML.
+The config is editable in Home Assistant, YAML will need to be used to set up zones with multiple panels.
 
 Ensure you have a token for your Nanoleaf Shapes panel by holding down the power button on the Shapes for 5-7 seconds until the lights flash, then running `curl -X POST http://xxx.xxx.xxx.xxx:16021/api/v1/new` with the IP address of your Shapes.
+
+The custom panel painter card JS should be copied to `/config/www/nanoleaf-panel-painter-card.js` and added as a resource (`/local/nanoleaf-panel-painter-card.js`) to be used in a dashboard.
 
 ## Notes
 
@@ -22,7 +24,7 @@ A framebuffer is saved to store the per-panel settings and make it look pretty i
 
 The default control mode of Nanoleaf Shapes is as an effect with extControl using UDP, streaming the colour/brightness info to the panel. Optionally this can be changed to use REST (not as performant for rapid colour/brightness changes). The add-on will change between modes when selecting a Scene with the full panel if required.
 
-It will try to display the panel layout and IDs as an image.
+It will try to display the panel layout and IDs as an image, and optionally the repo includes a custom card for interactive "painting" of the panels.
 
 Additionally, zones can be defined as groups of panels in the config.yaml using the panel IDs. This exposes the zone as a single light to HA. For example, two zones for the top and bottom of the panel can be set separately. Zones can have a max brightness or brightness multiplier set to reduce how bright they are.
 
@@ -30,66 +32,79 @@ My primary use for this was to enable functionality with Entertainment Zones in 
 
 ### Options
 
-| Configurable Options         | Description                                                     |
-| ---------------------------- |:---------------------------------------------------------------:|
-| output_mode                  | stream UDP or rest REST mode                                    |
-| stream_fps                   | Number of UDP frames to send per second                         |
-| stream_transition_time       | Transition setting of Nanoleaf API (in 10ms)                    |
-| render_on_startup            | Turn Nanoleaf on to saved state on startup                      |
-| global_brightness_value      | 0-100 set overrides default Nanoleaf integration brightness max |
-| sync_global_state            | Override default Nanoleaf integration if it makes changes       |
-| global_sync_interval_seconds | How often to override default Nanoleaf integration              |
-| brightness_multiplier        | 0-1 multiplier for how bright each zone can get                 |
-| max_brightness               | 0-1 set max absolute brightness for each zone                   |
+Relatively straightforward, descriptions added if required:
+
+| Configurable Options                   | Description                                                     |
+| -------------------------------------- |:---------------------------------------------------------------:|
+| output_mode                            | stream UDP or rest REST mode                                    |
+| stream_fps                             | Number of UDP frames to send per second                         |
+| stream_transition_time                 | Transition setting of Nanoleaf API (in 10ms)                    |
+| render_on_startup                      | Turn Nanoleaf on to saved state on startup                      |
+| global_brightness_value                | 0-100 set overrides default Nanoleaf integration brightness max |
+| sync_global_state                      | Override default Nanoleaf integration if it makes changes       |
+| global_sync_interval_seconds           | How often to override default Nanoleaf integration              |
+| brightness_multiplier                  | 0-1 multiplier for how bright each zone can get                 |
+| max_brightness                         | 0-1 set max absolute brightness for each zone                   |
+| layout_preview_panel_radius_multiplier | Set distance for panel shapes in preview card                   |
 
 Example config file:
 
 ```
-nanoleaf_ip: xxx.xxx.xxx.xxx
+nanoleaf_ip: 192.168.xxx.xxx
 nanoleaf_token: TOKEN
 mqtt_host: core-mosquitto
 mqtt_port: 1883
 mqtt_user: USERNAME
-mqtt_password:PASSWORD
+mqtt_password: PASSWORD
 output_mode: stream
 stream_fps: 25
 stream_transition_time: 1
 render_on_startup: false
 global_brightness_value: 100
-sync_global_state: true
+remember_effect_brightness: true
+sync_global_state: false
 global_sync_interval_seconds: 5
 enable_bridge_effects: true
-sparkle_effect_name: Sparkle
-sparkle_interval_seconds: float
-sparkle_min_multiplier: float
-sparkle_max_multiplier: float
-sparkle_smoothing: float
+sparkle_effect_name: Framebuffer Sparkle
+sparkle_interval_seconds: 1
+sparkle_min_multiplier: 0.2
+sparkle_max_multiplier: 1
+sparkle_smoothing: 0.9
+sparkle_blaze_speed: 0.25
+sparkle_blaze_spatial_scale: 0.01
+sparkle_blaze_secondary_amount: 0.35
 enable_layout_preview: true
-layout_preview_debounce_seconds: float
-layout_preview_padding: true
-layout_preview_labels: ture
-layout_preview_background: #000000
-layout_preview_stroke: #FFFFFF
+layout_preview_debounce_seconds: 0.25
+layout_preview_padding: 53
+layout_preview_panel_radius_multiplier: 0.5
+layout_preview_min_panel_radius: 18
+layout_preview_labels: true
+layout_preview_background: "#101418"
+layout_preview_stroke: "#d7dde5"
+enable_painter_brush: true
+painter_brush_name: Panel Painter Brush
+painter_brush_default_brightness: 255
+painter_brush_default_color: "#ffffff"
 zones:
   - name: Top Row
-    id: top_row_panels
+    id: nanoleaf_top_row
     panels:
       - 13475
       - 27059
       - 63775
       - 62872
       - 7593
-    brightness_multiplier: 0.5
+    brightness_multiplier: 0.7
     max_brightness: 1
   - name: Bottom Row
-    id: bottom_row_panels
+    id: nanoleaf_bottom_row
     panels:
       - 36421
       - 48544
       - 19012
       - 19960
-    brightness_multiplier: 1
+    brightness_multiplier: 0.7
     max_brightness: 1
 ```
 
-**Please note this was created with the use of AI, my programming skills are not this good.**
+Please note this was created with the help of AI, my programming skills are not this good.
