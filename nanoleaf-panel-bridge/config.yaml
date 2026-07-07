@@ -1,5 +1,5 @@
 name: Nanoleaf Panel Bridge
-version: "0.1.12"
+version: "0.1.13"
 slug: nanoleaf_panel_bridge
 description: Expose Nanoleaf Shapes panels and configurable zones as MQTT lights
 startup: services
@@ -21,6 +21,7 @@ options:
   stream_fps: 25
   stream_transition_time: 1
   render_on_startup: false
+  debug_logging: false
   global_brightness_value: 100
   remember_effect_brightness: true
   sync_global_state: true
@@ -59,6 +60,7 @@ schema:
   stream_fps: int
   stream_transition_time: int
   render_on_startup: bool
+  debug_logging: bool
   global_brightness_value: int
   remember_effect_brightness: bool
   sync_global_state: bool

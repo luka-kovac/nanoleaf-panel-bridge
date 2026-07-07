@@ -200,6 +200,16 @@ NANOLEAF_BASE_URL = f"http://{NANOLEAF_IP}:16021/api/v1/{NANOLEAF_TOKEN}"
 OUTPUT_MODE = str(config_value("output_mode", "OUTPUT_MODE", "stream")).lower()
 USE_STREAMING = OUTPUT_MODE in {"stream", "udp", "extcontrol", "ext_control"}
 
+# Debug logging. Leave disabled for normal use to avoid repeated stream/global
+# state messages in the add-on log. Enable when diagnosing Nanoleaf/API issues.
+DEBUG_LOGGING = config_bool("debug_logging", "DEBUG_LOGGING", False)
+
+
+def debug_log(message: str):
+    if DEBUG_LOGGING:
+        print(message)
+
+
 RENDER_DEBOUNCE_SECONDS = config_float(
     "render_debounce_seconds",
     "RENDER_DEBOUNCE_SECONDS",
@@ -1765,7 +1775,7 @@ class NanoleafBridge:
             if brightness is not None:
                 self.device_brightness = bounded_int(brightness, minimum=1, maximum=100)
 
-        print(
+        debug_log(
             "Updated Nanoleaf global state: "
             f"on={self.device_power_on}, brightness={self.device_brightness}"
         )
@@ -2313,7 +2323,7 @@ class NanoleafBridge:
             self.extcontrol_last_enabled = time.monotonic()
             self.active_effect = None
 
-        print("Enabled Nanoleaf extControl mode")
+        debug_log("Enabled Nanoleaf extControl mode")
 
     def stream_loop(self):
         period = 1.0 / STREAM_FPS
@@ -3236,6 +3246,7 @@ class NanoleafBridge:
                 "nanoleaf_global_power": self.device_power_on,
                 "nanoleaf_global_brightness": self.device_brightness,
                 "output_mode": OUTPUT_MODE,
+                "debug_logging": DEBUG_LOGGING,
                 "use_streaming": USE_STREAMING,
                 "stream_fps": STREAM_FPS,
                 "stream_transition_time_default": STREAM_TRANSITION_TIME,
